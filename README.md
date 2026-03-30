@@ -4,13 +4,11 @@ The python version is 3.12.
 
 There might be a assert error for the P2pNcclConnector. Modification for that in vllm lib is needed.
 
-## What Changed
-
-### Default Model
+## Default Model
 - **Model**: Qwen/Qwen2.5-7B-Instruct (7 billion parameter instruct-tuned model)
 - **Location**: Lines 7-8 in `pd_dis.py`
 
-### Implementation
+## Implementation
 
 #### Prefill Stage (Rank 0)
 1. Loads the Qwen2.5-7B-Instruct model
@@ -19,18 +17,12 @@ There might be a assert error for the P2pNcclConnector. Modification for that in
 4. Transfers KV cache to decode node via NCCL
 5. Measures prefill compute time and transfer time
 
-#### Decode Stage (Rank 1)
+### Decode Stage (Rank 1)
 1. Loads the Qwen2.5-7B-Instruct model
 2. Receives KV cache from prefill node
 3. Performs autoregressive token generation using the received KV cache
 4. Generates up to 50 new tokens
 5. Outputs the complete generated text
-
-### Key Features
-- Real model inference (not simulation)
-- Actual KV cache transfer between nodes
-- Measures prefill time, transfer time, and decode time
-- Outputs generated text from the model
 
 ## Requirements
 Updated `requirements.txt` includes:
