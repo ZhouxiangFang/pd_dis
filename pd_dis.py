@@ -14,10 +14,11 @@ Each node detects its role from SLURM_PROCID:
   Rank 1 (decode node)
   ─────────────────────
   • Starts vLLM on GPU 0, port 8200, as KV consumer.
-  • NIXL side-channel points at the prefill node (PREFILL_HOST).
+    • Binds NIXL side-channel listener on its own hostname.
   • Waits for both vLLM servers to be healthy.
-  • Starts toy_proxy_server.py on port 8000.
-  • Sends prompts through the proxy and prints results.
+    • Starts toy_proxy_server.py on port 8000 if available.
+    • Otherwise uses built-in two-phase prefill→decode requests.
+    • Sends prompts and prints results.
   • On exit, terminates decode vLLM, proxy, and cancels the SLURM job
     (which also terminates rank 0 / the prefill node).
 
@@ -31,7 +32,7 @@ Side-channel
 ────────────
 VLLM_NIXL_SIDE_CHANNEL_HOST / _PORT: lightweight TCP socket used ONLY for
 the initial NIXL handshake (memory-descriptor exchange).  NOT the data path.
-Both nodes point at the prefill node's hostname on port 5559.
+Each node binds this to its own hostname on port 5559.
 
 PREFILL_HOST
 ────────────
@@ -67,14 +68,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # NixlConnector KV-transfer config
-#   kv_role="kv_both"       — NixlConnector ignores role; proxy sets P/D routing
+#   kv_role: prefill="kv_producer", decode="kv_consumer"
+#            (important for vLLM>=0.18 NIXL side-channel behavior)
 #   kv_buffer_device="cuda" — keep transfer buffer in GPU VRAM (faster)
 # ---------------------------------------------------------------------------
-KV_CONFIG = json.dumps({
-    "kv_connector":     "NixlConnector",
-    "kv_role":          "kv_both",
-    "kv_buffer_device": "cuda",
-})
+def make_kv_config(kv_role: str) -> str:
+    return json.dumps({
+        "kv_connector": "NixlConnector",
+        "kv_role": kv_role,
+        "kv_buffer_device": "cuda",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +125,7 @@ def http_post(url: str, body: dict, timeout: float = 600) -> dict:
         return json.loads(resp.read())
 
 
-def find_proxy_script() -> Path:
+def find_proxy_script() -> Path | None:
     """Locate toy_proxy_server.py — local copy first, then vLLM package tree."""
     local = SCRIPT_DIR / "toy_proxy_server.py"
     if local.exists():
@@ -138,12 +141,83 @@ def find_proxy_script() -> Path:
     except ImportError:
         pass
     print(
-        "[Proxy] ERROR: toy_proxy_server.py not found.\n"
-        "  Copy it from vllm/tests/v1/kv_connector/nixl_integration/ "
-        "into the same directory as this script.",
-        file=sys.stderr,
+        "[Proxy] toy_proxy_server.py not found; using built-in direct "
+        "prefill→decode fallback.",
     )
-    sys.exit(1)
+    return None
+
+
+def extract_kv_transfer_params(response: dict) -> dict | None:
+    """Best-effort extraction of kv_transfer_params across response shapes."""
+    kv_params = response.get("kv_transfer_params")
+    if kv_params:
+        return kv_params
+
+    choices = response.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        kv_params = choices[0].get("kv_transfer_params")
+        if kv_params:
+            return kv_params
+        extra = choices[0].get("extra")
+        if isinstance(extra, dict):
+            kv_params = extra.get("kv_transfer_params")
+            if kv_params:
+                return kv_params
+
+    return None
+
+
+def two_phase_disagg_completion(
+    *,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    prefill_host: str,
+    timeout: float = 600,
+) -> dict:
+    """
+    Built-in fallback for disaggregated serving without toy_proxy_server.py:
+      1) prefill on node 0 with do_remote_decode=True
+      2) decode on node 1 with returned kv_transfer_params
+    """
+    prefill_resp = http_post(
+        f"http://{prefill_host}:{PREFILL_PORT}/v1/completions",
+        {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 1,
+            "temperature": temperature,
+            "kv_transfer_params": {"do_remote_decode": True},
+        },
+        timeout=timeout,
+    )
+
+    kv_params = extract_kv_transfer_params(prefill_resp)
+    if not kv_params:
+        # Some builds may complete remote decode directly for this request.
+        # In that case, return the prefill response if it already looks like
+        # a normal completion payload.
+        choices = prefill_resp.get("choices")
+        if isinstance(choices, list) and choices:
+            return prefill_resp
+        raise RuntimeError(
+            "Prefill response did not include kv_transfer_params; "
+            "cannot continue disaggregated decode. "
+            f"Response keys: {sorted(prefill_resp.keys())}"
+        )
+
+    return http_post(
+        f"http://localhost:{DECODE_PORT}/v1/completions",
+        {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "kv_transfer_params": kv_params,
+        },
+        timeout=timeout,
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -166,7 +240,7 @@ def optional_vllm_serve_flags() -> list[str]:
     return flags
 
 
-def vllm_cmd(args: argparse.Namespace, port: int) -> list[str]:
+def vllm_cmd(args: argparse.Namespace, port: int, kv_config: str) -> list[str]:
     """Build the common vllm serve command (port-agnostic parts)."""
     cmd = [
         "vllm", "serve", args.model,
@@ -177,7 +251,7 @@ def vllm_cmd(args: argparse.Namespace, port: int) -> list[str]:
         "--block-size",             str(args.block_size),
         "--dtype",                  "float16",
         "--enforce-eager",
-        "--kv-transfer-config",     KV_CONFIG,
+        "--kv-transfer-config",     kv_config,
     ]
     cmd.extend(optional_vllm_serve_flags())
     return cmd
@@ -193,9 +267,10 @@ def run_prefill(args: argparse.Namespace, my_host: str) -> None:
     to it via os.execvp so this Python process is fully replaced.
     Rank 0 blocks here until the job is cancelled by rank 1.
     """
+    kv_config = make_kv_config("kv_producer")
     print(f"[Prefill] host={my_host}  port={PREFILL_PORT}  model={args.model}")
     print(f"[Prefill] NIXL side-channel: {my_host}:{NIXL_SIDE_CHANNEL_PORT}")
-    print(f"[Prefill] KV config: {KV_CONFIG}")
+    print(f"[Prefill] KV config: {kv_config}")
 
     # Each node has exactly one GPU — CUDA_VISIBLE_DEVICES=0 is correct.
     os.environ.update({
@@ -207,7 +282,7 @@ def run_prefill(args: argparse.Namespace, my_host: str) -> None:
         "VLLM_NIXL_SIDE_CHANNEL_PORT": str(NIXL_SIDE_CHANNEL_PORT),
     })
 
-    cmd = vllm_cmd(args, PREFILL_PORT)
+    cmd = vllm_cmd(args, PREFILL_PORT, kv_config)
     os.execvp(cmd[0], cmd)   # replaces this process — nothing below runs
 
 
@@ -215,26 +290,30 @@ def run_prefill(args: argparse.Namespace, my_host: str) -> None:
 # Rank 1 — Decode node + proxy
 # ---------------------------------------------------------------------------
 
-def run_decode(args: argparse.Namespace, prefill_host: str) -> None:
+def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> None:
     """
-    Launch vLLM as the decode (KV consumer) instance, then start the
-    toy_proxy_server, process prompts, and clean up.
+    Launch vLLM as the decode (KV consumer) instance, then start
+    toy_proxy_server when available (or use built-in fallback),
+    process prompts, and clean up.
     """
+    kv_config = make_kv_config("kv_consumer")
     print(f"[Decode] port={DECODE_PORT}  model={args.model}")
+    print(f"[Decode] host={my_host}")
     print(f"[Decode] Prefill node: {prefill_host}:{PREFILL_PORT}")
-    print(f"[Decode] NIXL side-channel → {prefill_host}:{NIXL_SIDE_CHANNEL_PORT}")
-    print(f"[Decode] KV config: {KV_CONFIG}")
+    print(f"[Decode] NIXL side-channel bind: {my_host}:{NIXL_SIDE_CHANNEL_PORT}")
+    print(f"[Decode] KV config: {kv_config}")
 
     decode_env = {
         **os.environ,
         "CUDA_VISIBLE_DEVICES":        "0",   # one GPU per node
         "VLLM_KV_CACHE_LAYOUT":        "HND",
-        # Point at the prefill node's side-channel so NIXL can handshake.
-        "VLLM_NIXL_SIDE_CHANNEL_HOST": prefill_host,
+        # vLLM 0.18.0 starts a listener thread on each instance.
+        # Therefore this must be a local bindable host on the decode node.
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": my_host,
         "VLLM_NIXL_SIDE_CHANNEL_PORT": str(NIXL_SIDE_CHANNEL_PORT),
     }
 
-    decode_proc = subprocess.Popen(vllm_cmd(args, DECODE_PORT), env=decode_env)
+    decode_proc = subprocess.Popen(vllm_cmd(args, DECODE_PORT, kv_config), env=decode_env)
     procs = [decode_proc]
 
     def cleanup(*_):
@@ -264,31 +343,44 @@ def run_decode(args: argparse.Namespace, prefill_host: str) -> None:
     wait_for_health(prefill_host, PREFILL_PORT, "Prefill")
     wait_for_health("localhost",  DECODE_PORT,  "Decode")
 
-    # ── Start toy_proxy_server ────────────────────────────────────────────
+    # ── Start toy_proxy_server if available, else use built-in fallback ──
     proxy_script = find_proxy_script()
-    proxy_cmd = [
-        sys.executable, str(proxy_script),
-        "--port",            str(PROXY_PORT),
-        "--prefiller-hosts", prefill_host,
-        "--prefiller-ports", str(PREFILL_PORT),
-        "--decoder-hosts",   "localhost",
-        "--decoder-ports",   str(DECODE_PORT),
-    ]
-    print(f"[Proxy] Starting {proxy_script.name} on port {PROXY_PORT} ...")
-    proxy_proc = subprocess.Popen(proxy_cmd)
-    procs.append(proxy_proc)
+    use_external_proxy = proxy_script is not None
 
-    wait_for_health("localhost", PROXY_PORT, "Proxy", poll=1.0, timeout=30.0)
+    if use_external_proxy:
+        proxy_cmd = [
+            sys.executable, str(proxy_script),
+            "--port",            str(PROXY_PORT),
+            "--prefiller-hosts", prefill_host,
+            "--prefiller-ports", str(PREFILL_PORT),
+            "--decoder-hosts",   "localhost",
+            "--decoder-ports",   str(DECODE_PORT),
+        ]
+        print(f"[Proxy] Starting {proxy_script.name} on port {PROXY_PORT} ...")
+        proxy_proc = subprocess.Popen(proxy_cmd)
+        procs.append(proxy_proc)
+        wait_for_health("localhost", PROXY_PORT, "Proxy", poll=1.0, timeout=30.0)
+    else:
+        print("[Proxy] Using built-in two-phase prefill→decode flow.")
 
     # ── Optional warmup ───────────────────────────────────────────────────
     if args.warmup:
         print("[Warmup] Sending warmup request ...")
         try:
-            http_post(
-                f"http://localhost:{PROXY_PORT}/v1/completions",
-                {"model": args.model, "prompt": "warmup",
-                 "max_tokens": args.warmup_max_tokens, "temperature": 0},
-            )
+            if use_external_proxy:
+                http_post(
+                    f"http://localhost:{PROXY_PORT}/v1/completions",
+                    {"model": args.model, "prompt": "warmup",
+                     "max_tokens": args.warmup_max_tokens, "temperature": 0},
+                )
+            else:
+                two_phase_disagg_completion(
+                    model=args.model,
+                    prompt="warmup",
+                    max_tokens=args.warmup_max_tokens,
+                    temperature=0,
+                    prefill_host=prefill_host,
+                )
             print("[Warmup] Done.")
         except Exception as exc:
             print(f"[Warmup] Warning: {exc} (continuing)", file=sys.stderr)
@@ -308,11 +400,20 @@ def run_decode(args: argparse.Namespace, prefill_host: str) -> None:
 
         t0 = time.perf_counter()
         try:
-            response = http_post(
-                f"http://localhost:{PROXY_PORT}/v1/completions",
-                {"model": args.model, "prompt": prompt,
-                 "max_tokens": args.max_tokens, "temperature": 0},
-            )
+            if use_external_proxy:
+                response = http_post(
+                    f"http://localhost:{PROXY_PORT}/v1/completions",
+                    {"model": args.model, "prompt": prompt,
+                     "max_tokens": args.max_tokens, "temperature": 0},
+                )
+            else:
+                response = two_phase_disagg_completion(
+                    model=args.model,
+                    prompt=prompt,
+                    max_tokens=args.max_tokens,
+                    temperature=0,
+                    prefill_host=prefill_host,
+                )
             t1 = time.perf_counter()
 
             usage      = response.get("usage", {})
@@ -406,7 +507,7 @@ def main() -> None:
     if rank == 0:
         run_prefill(args, my_host)
     else:
-        run_decode(args, prefill_host)
+        run_decode(args, prefill_host, my_host)
 
 
 if __name__ == "__main__":
