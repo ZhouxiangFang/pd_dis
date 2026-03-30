@@ -98,6 +98,73 @@ def http_post(url: str, body: dict) -> dict:
         return json.loads(resp.read())
 
 
+def stream_decode(url: str, body: dict):
+    """POST url with stream=True.
+
+    Returns (response_dict, t_first_token, t_last_token, n_tokens) where
+    timestamps are from time.perf_counter() at the moment each boundary token
+    arrived — giving true TTFT and per-token decode cadence.
+    """
+    streaming_body = {
+        **body,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    data = json.dumps(streaming_body).encode()
+    req  = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    t_first: float | None = None
+    t_last:  float | None = None
+    text_parts: list[str] = []
+    last_meta: dict       = {}
+    usage: dict           = {}
+
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        for raw in resp:
+            line = raw.decode().strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            chunk = json.loads(payload)
+            if chunk.get("usage"):                   # trailing usage chunk
+                usage = chunk["usage"]
+            if not chunk.get("choices"):
+                continue
+            last_meta  = chunk
+            token_text = chunk["choices"][0].get("text", "")
+            if token_text:
+                now = time.perf_counter()
+                if t_first is None:
+                    t_first = now
+                t_last = now
+                text_parts.append(token_text)
+
+    now     = time.perf_counter()
+    t_first = t_first or now
+    t_last  = t_last  or now
+
+    # Prefer server-reported token count; fall back to chunk count
+    n_tokens = usage.get("completion_tokens") or len(text_parts) or 1
+
+    response = {
+        "id":      last_meta.get("id", ""),
+        "object":  "text_completion",
+        "created": last_meta.get("created", 0),
+        "model":   last_meta.get("model", body.get("model", "")),
+        "choices": [{
+            "text":          "".join(text_parts),
+            "index":         0,
+            "finish_reason": last_meta["choices"][0].get("finish_reason"),
+            "logprobs":      None,
+        }],
+        "usage": usage,
+    }
+    return response, t_first, t_last, n_tokens
+
+
 def kv_config(role: str, rank: int) -> str:
     return json.dumps({
         "kv_connector":     "P2pNcclConnector",
@@ -141,13 +208,24 @@ class DisaggProxyHandler(BaseHTTPRequestHandler):
         decode_body  = {**body,
                         "request_id": f"{uid}___prefill_addr_{self.prefill_zmq}___"}
 
+        t0 = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             prefill_fut = pool.submit(http_post,
                                       self.prefill_url + endpoint, prefill_body)
-            decode_fut  = pool.submit(http_post,
+            decode_fut  = pool.submit(stream_decode,
                                       self.decode_url  + endpoint, decode_body)
-            prefill_fut.result()           # wait for KV transfer to complete
-            response = decode_fut.result() # decode response is the real answer
+            try:
+                prefill_fut.result()       # wait for KV transfer to complete
+            except Exception:
+                pass                       # prefill may timeout; decode still works
+            response, t_first, t_last, n_tokens = decode_fut.result()
+
+        # t_first = time of first decoded token  (TTFT = prefill + KV transfer)
+        # t_last  = time of last  decoded token
+        response["_prefill_time"]  = round(t_first - t0, 3)
+        response["_decode_time"]   = round(t_last  - t_first, 3)
+        response["_total_time"]    = round(t_last  - t0, 3)
+        response["_decode_tokens"] = n_tokens
 
         payload = json.dumps(response).encode()
         self.send_response(200)
@@ -243,6 +321,7 @@ def run_decode(args):
 
     proxy_url  = f"http://localhost:{PROXY_PORT}"
     total_start = time.perf_counter()
+    results = []
 
     try:
         for i, prompt in enumerate(prompts, 1):
@@ -251,29 +330,65 @@ def run_decode(args):
             print(f"{'='*60}")
             print(f"  Input : {prompt}")
 
-            t_start = time.perf_counter()
             try:
                 response = http_post(
                     f"{proxy_url}/v1/completions",
                     {"model": args.model, "prompt": prompt,
                      "max_tokens": args.max_tokens, "temperature": 0},
                 )
-                elapsed = time.perf_counter() - t_start
-                usage   = response.get("usage", {})
+                usage      = response.get("usage", {})
+                output     = response["choices"][0]["text"]
+                prefill_t  = response.get("_prefill_time", 0.0)
+                decode_t   = response.get("_decode_time",  0.0)
+                total_t    = response.get("_total_time",   0.0)
+                n_decoded  = usage.get("completion_tokens") or 1
+                ms_per_tok = decode_t / n_decoded * 1000
 
-                print(f"  Output: {response['choices'][0]['text']}")
-                print(f"  Tokens: prompt={usage.get('prompt_tokens')}  "
+                print(f"  Output  : {output}")
+                print(f"  Tokens  : prompt={usage.get('prompt_tokens')}  "
                       f"completion={usage.get('completion_tokens')}  "
                       f"total={usage.get('total_tokens')}")
-                print(f"  Latency: {elapsed:.3f}s")
+                print(f"  Prefill : {prefill_t:.3f}s  (Time to first token, TTFT)")
+                print(f"  Decode  : {decode_t:.3f}s total  |  "
+                      f"{ms_per_tok:.1f} ms/token avg  |  "
+                      f"{1000/ms_per_tok:.1f} tok/s")
+                print(f"  Total   : {total_t:.3f}s")
+
+                results.append({
+                    "prompt": prompt, "output": output,
+                    "usage": usage,
+                    "prefill_time":  prefill_t,
+                    "decode_time":   decode_t,
+                    "total_time":    total_t,
+                    "ms_per_token":  ms_per_tok,
+                })
 
             except Exception as exc:
                 print(f"  ERROR: {exc}", file=sys.stderr)
+                results.append({"prompt": prompt, "error": str(exc)})
 
         total_elapsed = time.perf_counter() - total_start
+
+        # ── Final summary ──────────────────────────────────────────────
         print(f"\n{'='*60}")
-        print(f"  All {len(prompts)} prompt(s) done in {total_elapsed:.3f}s total.")
+        print(f"  SUMMARY  ({len(results)} prompt(s), wall-clock {total_elapsed:.3f}s)")
         print(f"{'='*60}")
+        for j, r in enumerate(results, 1):
+            print(f"\n  [{j}] Input   : {r['prompt']}")
+            if "error" in r:
+                print(f"       Error   : {r['error']}")
+            else:
+                print(f"       Output  : {r['output']}")
+                u = r["usage"]
+                print(f"       Tokens  : prompt={u.get('prompt_tokens')}  "
+                      f"completion={u.get('completion_tokens')}  "
+                      f"total={u.get('total_tokens')}")
+                print(f"       Prefill : {r['prefill_time']:.3f}s  (Time to first token, TTFT)")
+                print(f"       Decode  : {r['decode_time']:.3f}s total  |  "
+                      f"{r['ms_per_token']:.1f} ms/token avg  |  "
+                      f"{1000/r['ms_per_token']:.1f} tok/s")
+                print(f"       Total   : {r['total_time']:.3f}s")
+        print(f"\n{'='*60}")
 
     finally:
         proxy.shutdown()
