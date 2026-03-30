@@ -59,6 +59,8 @@ PREFILL_PORT = int(os.environ.get("PREFILL_PORT", 8100))
 DECODE_PORT  = int(os.environ.get("DECODE_PORT",  8200))
 PROXY_PORT   = int(os.environ.get("PROXY_PORT",   8000))
 KV_PORT      = int(os.environ.get("KV_PORT",      14579))
+DECODE_WAIT_TIMEOUT = float(os.environ.get("DECODE_WAIT_TIMEOUT", 120))
+DECODE_HTTP_TIMEOUT = float(os.environ.get("DECODE_HTTP_TIMEOUT", 300))
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +91,23 @@ def wait_for_health(url: str, label: str, poll_interval: float = 5.0):
             time.sleep(poll_interval)
 
 
-def http_post(url: str, body: dict) -> dict:
+def http_post(url: str, body: dict, timeout: float = 600) -> dict:
     data = json.dumps(body).encode()
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
+
+
+def sync_decode(url: str, body: dict, timeout: float = DECODE_HTTP_TIMEOUT):
+    """Non-stream decode path to avoid hanging stream chunk iteration."""
+    t0 = time.perf_counter()
+    response = http_post(url, body, timeout=timeout)
+    t1 = time.perf_counter()
+    usage = response.get("usage", {})
+    n_tokens = usage.get("completion_tokens") or 1
+    return response, t0, t1, n_tokens
 
 
 def vllm_mode_args(mode: str) -> list[str]:
@@ -134,9 +146,10 @@ def stream_decode(url: str, body: dict):
     usage: dict           = {}
     line_count = 0
     max_idle = 60  # max seconds without seeing a token
+    req_timeout = 120
 
     try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
+        with urllib.request.urlopen(req, timeout=req_timeout) as resp:
             t_last_chunk = time.perf_counter()
             for raw in resp:
                 now = time.perf_counter()
@@ -178,6 +191,15 @@ def stream_decode(url: str, body: dict):
 
     # Prefer server-reported token count; fall back to chunk count
     n_tokens = usage.get("completion_tokens") or len(text_parts) or 1
+
+    # Some backends may not stream chunks reliably; fall back to regular POST.
+    if not text_parts and not usage:
+        t_sync0 = time.perf_counter()
+        response = http_post(url, body)
+        t_sync1 = time.perf_counter()
+        usage = response.get("usage", {})
+        n_tokens = usage.get("completion_tokens") or 1
+        return response, t_sync0, t_sync1, n_tokens
 
     response = {
         "id":      last_meta.get("id", ""),
@@ -237,7 +259,7 @@ class DisaggProxyHandler(BaseHTTPRequestHandler):
         # Prefill should only build/send KV cache; do not decode/generate tokens on GPU0.
         prefill_body = {
             **body,
-            "max_tokens": 0,
+            "max_tokens": 1,
             "stream": False,
             "request_id": f"{uid}___decode_addr_{self.decode_zmq}",
         }
@@ -249,10 +271,38 @@ class DisaggProxyHandler(BaseHTTPRequestHandler):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             prefill_fut = pool.submit(http_post,
                                       self.prefill_url + endpoint, prefill_body)
-            decode_fut  = pool.submit(stream_decode,
-                                      self.decode_url  + endpoint, decode_body)
+            decode_fut  = pool.submit(sync_decode,
+                                      self.decode_url + endpoint,
+                                      decode_body,
+                                      DECODE_HTTP_TIMEOUT)
             print(f"[Proxy] [uid={uid[:8]}] Waiting for decode...", file=sys.stderr)
-            response, t_first, t_last, n_tokens = decode_fut.result()
+            try:
+                response, t_first, t_last, n_tokens = decode_fut.result(
+                    timeout=DECODE_WAIT_TIMEOUT
+                )
+            except concurrent.futures.TimeoutError:
+                print(
+                    f"[Proxy] [uid={uid[:8]}] Decode wait timed out after "
+                    f"{DECODE_WAIT_TIMEOUT:.0f}s; returning timeout error.",
+                    file=sys.stderr,
+                )
+                decode_fut.cancel()
+                response = {
+                    "id": uid,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": body.get("model", ""),
+                    "choices": [{
+                        "text": "",
+                        "index": 0,
+                        "finish_reason": "timeout",
+                        "logprobs": None,
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "error": f"Decode timed out after {DECODE_WAIT_TIMEOUT:.0f}s",
+                }
+                t_first = t_last = time.perf_counter()
+                n_tokens = 0
             print(f"[Proxy] [uid={uid[:8]}] Decode done, n_tokens={n_tokens}", file=sys.stderr)
             # Do not block the client on prefill finishing full generation.
             # Decode completion already implies KV transfer succeeded.
@@ -410,16 +460,19 @@ def run_decode(args):
                 decode_t   = response.get("_decode_time",  0.0)
                 total_t    = response.get("_total_time",   0.0)
                 n_decoded  = usage.get("completion_tokens") or 1
-                ms_per_tok = decode_t / n_decoded * 1000
+                ms_per_tok = (decode_t / n_decoded * 1000) if (n_decoded and decode_t > 0) else None
 
                 print(f"  Output  : {output}")
                 print(f"  Tokens  : prompt={usage.get('prompt_tokens')}  "
                       f"completion={usage.get('completion_tokens')}  "
                       f"total={usage.get('total_tokens')}")
                 print(f"  Prefill : {prefill_t:.3f}s  (Time to first token, TTFT)")
-                print(f"  Decode  : {decode_t:.3f}s total  |  "
-                      f"{ms_per_tok:.1f} ms/token avg  |  "
-                      f"{1000/ms_per_tok:.1f} tok/s")
+                if ms_per_tok is None:
+                    print(f"  Decode  : {decode_t:.3f}s total")
+                else:
+                    print(f"  Decode  : {decode_t:.3f}s total  |  "
+                          f"{ms_per_tok:.1f} ms/token avg  |  "
+                          f"{1000/ms_per_tok:.1f} tok/s")
                 print(f"  Total   : {total_t:.3f}s")
 
                 results.append({
@@ -454,9 +507,12 @@ def run_decode(args):
                       f"completion={u.get('completion_tokens')}  "
                       f"total={u.get('total_tokens')}")
                 print(f"       Prefill : {r['prefill_time']:.3f}s  (Time to first token, TTFT)")
-                print(f"       Decode  : {r['decode_time']:.3f}s total  |  "
-                      f"{r['ms_per_token']:.1f} ms/token avg  |  "
-                      f"{1000/r['ms_per_token']:.1f} tok/s")
+                if r["ms_per_token"] is None:
+                    print(f"       Decode  : {r['decode_time']:.3f}s total")
+                else:
+                    print(f"       Decode  : {r['decode_time']:.3f}s total  |  "
+                          f"{r['ms_per_token']:.1f} ms/token avg  |  "
+                          f"{1000/r['ms_per_token']:.1f} tok/s")
                 print(f"       Total   : {r['total_time']:.3f}s")
         print(f"\n{'='*60}")
 
@@ -485,7 +541,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--startup-mode",
         choices=["fast", "balanced", "throughput"],
-        default="fast",
+        default="throughput",
         help=(
             "vLLM startup/runtime tradeoff. "
             "fast skips compile/graph-capture warmup for lower startup latency."
