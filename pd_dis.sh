@@ -7,6 +7,7 @@
 #SBATCH --gres=gpu:lovelace:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
 #SBATCH --output=../log/pd_disagg_%j.txt
 
 # check nodes:   sinfo -o "%20N %15P %20G %10T" | grep -v "down"
@@ -53,6 +54,19 @@ export NCCL_NET=IB
 # Optional: print NCCL transport selection at startup for verification
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=NET
+
+# XALT (the system's executable tracking tool) injects /opt/apps/xalt/default/lib64
+# into LD_PRELOAD, which pulls in an older libcrypto.so that lacks OPENSSL_3.4.0.
+# Disable XALT tracking for this job and clear LD_PRELOAD to prevent the injection.
+export XALT_EXECUTABLE_TRACKING=no
+unset LD_PRELOAD
+
+CONDA_ENV=/scratch/$USER/comp529/miniconda3/envs/nlp
+export PATH=$CONDA_ENV/bin:$PATH
+export LD_LIBRARY_PATH=$CONDA_ENV/lib:$LD_LIBRARY_PATH
+
+# Cache HuggingFace models to project scratch space instead of home quota
+export HF_HOME=/scratch/$USER/comp529/cache
 
 # srun launches one task per node (SLURM_PROCID=0 → prefill, SLURM_PROCID=1 → decode)
 srun python pd_dis.py "$@"

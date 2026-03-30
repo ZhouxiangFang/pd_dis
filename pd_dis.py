@@ -6,8 +6,8 @@ Rank 1 (decode node):  vllm serve  --kv-role kv_consumer  +  disagg proxy
 
 KV cache transport
 ------------------
-PyNcclConnector drives the KV transfer.  NCCL uses InfiniBand with GPU Direct
-RDMA (GDR) when the env vars in pd_dis.sh are set:
+P2pNcclConnector drives the KV transfer via ZMQ (control) + NCCL (data).
+NCCL uses InfiniBand with GPU Direct RDMA when the env vars in pd_dis.sh are set:
 
   NCCL_NET=IB               -> force IB transport (no Ethernet fallback)
   NCCL_NET_GDR_LEVEL=5      -> GPU Direct RDMA for all messages (SYS level)
@@ -18,20 +18,36 @@ With GDR active the data path is:
   GPU VRAM -> IB HCA (PCIe peer-to-peer) -> remote IB HCA -> GPU VRAM
 without staging through host (CPU) memory on either side.
 
-Proxy routing
--------------
-  1. POST to prefill server  -> prefill runs, KV cache pushed via RDMA
-  2. POST to decode server   -> decode runs using the received KV cache
+Proxy routing  (P2pNcclConnector request_id convention)
+--------------------------------------------------------
+The connector locates the remote ZMQ socket via the request_id field:
+  Prefill request_id:  <uid>___decode_addr_<decode_host>:<kv_port>
+  Decode  request_id:  <uid>___prefill_addr_<prefill_host>:<kv_port>___
+
+The inline proxy sets these fields and fans each request out to both servers
+concurrently; the decode server blocks internally until it receives the KV
+cache from prefill, then generates tokens and returns the response.
+
+Prompts
+-------
+Prompts are read from a plain-text file (one prompt per line).
+Lines starting with # and blank lines are ignored.
+Default file: prompts.txt (same directory as this script).
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
+import threading
 import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 # ---------------------------------------------------------------------------
@@ -44,32 +60,39 @@ DECODE_PORT  = int(os.environ.get("DECODE_PORT",  8200))
 PROXY_PORT   = int(os.environ.get("PROXY_PORT",   8000))
 KV_PORT      = int(os.environ.get("KV_PORT",      14579))
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def load_prompts(path: str) -> list:
+    """Read prompts from a text file. One prompt per line; # lines are comments."""
+    if not os.path.exists(path):
+        print(f"[ERROR] Prompts file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    with open(path) as f:
+        prompts = [line.strip() for line in f
+                   if line.strip() and not line.startswith("#")]
+    if not prompts:
+        print(f"[ERROR] No prompts found in {path}", file=sys.stderr)
+        sys.exit(1)
+    return prompts
+
+
 def wait_for_health(url: str, label: str, poll_interval: float = 5.0):
-    print(f"[{label}] Waiting for {url} ...")
+    print(f"[{label}] Waiting for {url} to be ready ...")
     while True:
         try:
             urllib.request.urlopen(f"{url}/health", timeout=3)
-            print(f"[{label}] {url} is healthy.")
             return
         except Exception:
             time.sleep(poll_interval)
 
 
-def send_request(url: str, model: str, prompt: str, max_tokens: int) -> dict:
-    body = json.dumps({
-        "model":       model,
-        "prompt":      prompt,
-        "max_tokens":  max_tokens,
-        "temperature": 0,
-    }).encode()
+def http_post(url: str, body: dict) -> dict:
+    data = json.dumps(body).encode()
     req = urllib.request.Request(
-        f"{url}/v1/completions",
-        data=body,
-        headers={"Content-Type": "application/json"},
+        url, data=data, headers={"Content-Type": "application/json"}
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         return json.loads(resp.read())
@@ -77,13 +100,73 @@ def send_request(url: str, model: str, prompt: str, max_tokens: int) -> dict:
 
 def kv_config(role: str, rank: int) -> str:
     return json.dumps({
-        "kv_connector":    "PyNcclConnector",
-        "kv_role":         role,           # "kv_producer" or "kv_consumer"
-        "kv_rank":         rank,
+        "kv_connector":     "P2pNcclConnector",
+        "kv_role":          role,   # "kv_producer" or "kv_consumer"
+        "kv_rank":          rank,
         "kv_parallel_size": 2,
-        "kv_ip":           PREFILL_HOST,
-        "kv_port":         KV_PORT,
+        "kv_ip":            PREFILL_HOST,
+        "kv_port":          KV_PORT,
     })
+
+
+# ---------------------------------------------------------------------------
+# Inline disaggregated proxy
+#
+# P2pNcclConnector routes via ZMQ addresses embedded in request_id:
+#   prefill sees: <uid>___decode_addr_<decode_zmq>
+#   decode  sees: <uid>___prefill_addr_<prefill_zmq>___
+#
+# Both requests are sent concurrently. The decode server blocks until it
+# receives the KV cache from prefill, then returns the completion response.
+# ---------------------------------------------------------------------------
+
+class DisaggProxyHandler(BaseHTTPRequestHandler):
+    prefill_url: str = ""
+    decode_url:  str = ""
+    prefill_zmq: str = ""   # HOST:KV_PORT
+    decode_zmq:  str = ""   # HOST:KV_PORT
+
+    def log_message(self, fmt, *args):
+        pass  # suppress per-request access logs
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length))
+
+        uid = str(uuid.uuid4())
+        endpoint = f"/v1/completions"
+
+        prefill_body = {**body,
+                        "request_id": f"{uid}___decode_addr_{self.decode_zmq}"}
+        decode_body  = {**body,
+                        "request_id": f"{uid}___prefill_addr_{self.prefill_zmq}___"}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            prefill_fut = pool.submit(http_post,
+                                      self.prefill_url + endpoint, prefill_body)
+            decode_fut  = pool.submit(http_post,
+                                      self.decode_url  + endpoint, decode_body)
+            prefill_fut.result()           # wait for KV transfer to complete
+            response = decode_fut.result() # decode response is the real answer
+
+        payload = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def start_proxy(prefill_url, decode_url, prefill_zmq, decode_zmq, port):
+    DisaggProxyHandler.prefill_url = prefill_url
+    DisaggProxyHandler.decode_url  = decode_url
+    DisaggProxyHandler.prefill_zmq = prefill_zmq
+    DisaggProxyHandler.decode_zmq  = decode_zmq
+
+    server = HTTPServer(("0.0.0.0", port), DisaggProxyHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -91,20 +174,23 @@ def kv_config(role: str, rank: int) -> str:
 # ---------------------------------------------------------------------------
 
 def run_prefill(args):
-    print(f"[Prefill] Starting vLLM server on {PREFILL_HOST}:{PREFILL_PORT}")
     cfg = kv_config("kv_producer", rank=0)
+    print(f"[Prefill] Initializing GPU and loading model '{args.model}' ...")
     print(f"[Prefill] KV config: {cfg}")
 
-    # Blocking — process stays alive until the job is cancelled by rank 1
-    os.execvp("vllm", [
+    # os.execvp replaces this Python process with vLLM — no code runs after.
+    # Rank 1's wait_for_health(:8100) confirms the GPU is ready.
+    cmd = [
         "vllm", "serve", args.model,
         "--host", "0.0.0.0",
         "--port", str(PREFILL_PORT),
         "--max-model-len", str(args.max_model_len),
         "--dtype", "float16",
-        "--disable-log-requests",
         "--kv-transfer-config", cfg,
-    ])
+    ]
+    if args.quantization:
+        cmd += ["--quantization", args.quantization]
+    os.execvp("vllm", cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -112,67 +198,91 @@ def run_prefill(args):
 # ---------------------------------------------------------------------------
 
 def run_decode(args):
-    print(f"[Decode] Starting vLLM server on port {DECODE_PORT}")
     cfg = kv_config("kv_consumer", rank=1)
+    print(f"[Decode] Initializing GPU and loading model '{args.model}' ...")
     print(f"[Decode] KV config: {cfg}")
 
-    decode_proc = subprocess.Popen([
+    cmd = [
         "vllm", "serve", args.model,
         "--host", "0.0.0.0",
         "--port", str(DECODE_PORT),
         "--max-model-len", str(args.max_model_len),
         "--dtype", "float16",
-        "--disable-log-requests",
         "--kv-transfer-config", cfg,
-    ])
+    ]
+    if args.quantization:
+        cmd += ["--quantization", args.quantization]
+    decode_proc = subprocess.Popen(cmd)
 
-    # Wait for both servers to be healthy before starting the proxy
+    # Health checks confirm both GPUs have finished loading the model
     wait_for_health(f"http://{PREFILL_HOST}:{PREFILL_PORT}", "Decode")
+    print(f"[Prefill] GPU initialized and ready  ({PREFILL_HOST}:{PREFILL_PORT})")
+
     wait_for_health(f"http://localhost:{DECODE_PORT}", "Decode")
+    print(f"[Decode]  GPU initialized and ready  (localhost:{DECODE_PORT})")
 
-    # Start disaggregated prefill proxy
-    # The proxy sends each request to the prefill server first (triggering KV
-    # transfer via NCCL), then forwards the same request to the decode server.
-    print(f"[Decode] Starting disagg proxy on port {PROXY_PORT} ...")
-    proxy_proc = subprocess.Popen([
-        sys.executable, "-m", "vllm.entrypoints.disagg_prefill_proxy_server",
-        "--host",    "0.0.0.0",
-        "--port",    str(PROXY_PORT),
-        "--prefill", f"http://{PREFILL_HOST}:{PREFILL_PORT}",
-        "--decode",  f"http://localhost:{DECODE_PORT}",
-    ])
-    time.sleep(5)  # give proxy time to bind
+    # ZMQ addresses used by P2pNcclConnector for KV routing
+    decode_host = socket.gethostname()
+    prefill_zmq = f"{PREFILL_HOST}:{KV_PORT}"
+    decode_zmq  = f"{decode_host}:{KV_PORT}"
 
-    # Send test request through the proxy
-    proxy_url = f"http://localhost:{PROXY_PORT}"
-    print(f"[Decode] Sending test request: {args.prompt!r}")
-    t_start = time.perf_counter()
+    # Start inline disagg proxy
+    proxy = start_proxy(
+        prefill_url = f"http://{PREFILL_HOST}:{PREFILL_PORT}",
+        decode_url  = f"http://localhost:{DECODE_PORT}",
+        prefill_zmq = prefill_zmq,
+        decode_zmq  = decode_zmq,
+        port        = PROXY_PORT,
+    )
+    print(f"[Decode] Disagg proxy listening on port {PROXY_PORT}")
+    print(f"[Decode] Prefill ZMQ: {prefill_zmq}  |  Decode ZMQ: {decode_zmq}")
+
+    # Load and process prompts
+    prompts = load_prompts(args.prompts_file)
+    print(f"[Decode] Loaded {len(prompts)} prompt(s) from '{args.prompts_file}'")
+
+    proxy_url  = f"http://localhost:{PROXY_PORT}"
+    total_start = time.perf_counter()
+
     try:
-        response = send_request(proxy_url, args.model, args.prompt, args.max_tokens)
-        elapsed = time.perf_counter() - t_start
+        for i, prompt in enumerate(prompts, 1):
+            print(f"\n{'='*60}")
+            print(f"  Prompt {i}/{len(prompts)}")
+            print(f"{'='*60}")
+            print(f"  Input : {prompt}")
 
-        print("=== Generated Text ===")
-        print(response["choices"][0]["text"])
-        usage = response.get("usage", {})
-        if usage:
-            print(f"=== Usage: prompt={usage.get('prompt_tokens')} "
-                  f"completion={usage.get('completion_tokens')} "
-                  f"total={usage.get('total_tokens')} ===")
-        print(f"Total end-to-end latency: {elapsed:.3f}s")
+            t_start = time.perf_counter()
+            try:
+                response = http_post(
+                    f"{proxy_url}/v1/completions",
+                    {"model": args.model, "prompt": prompt,
+                     "max_tokens": args.max_tokens, "temperature": 0},
+                )
+                elapsed = time.perf_counter() - t_start
+                usage   = response.get("usage", {})
 
-    except Exception as exc:
-        print(f"[Decode] ERROR: request failed — {exc}", file=sys.stderr)
+                print(f"  Output: {response['choices'][0]['text']}")
+                print(f"  Tokens: prompt={usage.get('prompt_tokens')}  "
+                      f"completion={usage.get('completion_tokens')}  "
+                      f"total={usage.get('total_tokens')}")
+                print(f"  Latency: {elapsed:.3f}s")
+
+            except Exception as exc:
+                print(f"  ERROR: {exc}", file=sys.stderr)
+
+        total_elapsed = time.perf_counter() - total_start
+        print(f"\n{'='*60}")
+        print(f"  All {len(prompts)} prompt(s) done in {total_elapsed:.3f}s total.")
+        print(f"{'='*60}")
 
     finally:
-        # Clean up local processes; scancel releases the prefill node
-        for proc in (proxy_proc, decode_proc):
-            proc.send_signal(signal.SIGTERM)
-        for proc in (proxy_proc, decode_proc):
-            proc.wait()
+        proxy.shutdown()
+        decode_proc.send_signal(signal.SIGTERM)
+        decode_proc.wait()
 
         slurm_job_id = os.environ.get("SLURM_JOB_ID")
         if slurm_job_id:
-            print(f"[Decode] Cancelling SLURM job {slurm_job_id} to release prefill node ...")
+            print(f"[Decode] Cancelling SLURM job {slurm_job_id} ...")
             os.system(f"scancel {slurm_job_id}")
 
 
@@ -181,11 +291,16 @@ def run_decode(args):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
     parser = argparse.ArgumentParser(description="vLLM-based prefill-decode disaggregation")
-    parser.add_argument("--model",          default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--prompt",         default="Explain what prefill-decode disaggregation means in LLM inference:")
-    parser.add_argument("--max-tokens",     type=int, default=1024)
-    parser.add_argument("--max-model-len",  type=int, default=4096)
+    parser.add_argument("--model",         default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--quantization",  default=None,
+                        help="vLLM quantization method (e.g. awq, gptq, fp8)")
+    parser.add_argument("--prompts-file",  default=os.path.join(script_dir, "prompts.txt"),
+                        help="Path to a text file with one prompt per line")
+    parser.add_argument("--max-tokens",    type=int, default=1024)
+    parser.add_argument("--max-model-len", type=int, default=4096)
     args = parser.parse_args()
 
     rank = int(os.environ.get("SLURM_PROCID", 0))

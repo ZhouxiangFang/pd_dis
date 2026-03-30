@@ -1,6 +1,6 @@
 # Prefill-Decode Disaggregation with Qwen2.5-7B-Instruct
 
-This implementation demonstrates prefill-decode disaggregation using the **Qwen/Qwen2.5-7B-Instruct** model.
+The python version is 3.12
 
 ## What Changed
 
