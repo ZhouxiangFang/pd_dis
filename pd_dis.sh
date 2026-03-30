@@ -23,4 +23,4 @@ export WORLD_SIZE=2
 
 # Run the python script
 # srun will launch one process per node (Rank 0 and Rank 1)
-srun python pd_dis.py
+srun python pd_dis.py "$@"
