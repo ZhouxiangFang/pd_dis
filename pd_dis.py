@@ -94,7 +94,7 @@ def http_post(url: str, body: dict) -> dict:
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=500) as resp:
         return json.loads(resp.read())
 
 
@@ -120,7 +120,7 @@ def stream_decode(url: str, body: dict):
     last_meta: dict       = {}
     usage: dict           = {}
 
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    with urllib.request.urlopen(req, timeout=500) as resp:
         for raw in resp:
             line = raw.decode().strip()
             if not line.startswith("data:"):
