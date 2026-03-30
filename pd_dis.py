@@ -94,8 +94,21 @@ def http_post(url: str, body: dict) -> dict:
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=500) as resp:
+    with urllib.request.urlopen(req, timeout=600) as resp:
         return json.loads(resp.read())
+
+
+def vllm_mode_args(mode: str) -> list[str]:
+    """Extra vLLM serve args for startup/runtime trade-offs.
+
+    fast:       lowest startup latency (best for short interactive runs)
+    balanced:   baseline behavior
+    throughput: alias of baseline for now (explicit intent)
+    """
+    if mode == "fast":
+        # Skip torch.compile + CUDA graph capture warmup; first token comes much sooner.
+        return ["--enforce-eager"]
+    return []
 
 
 def stream_decode(url: str, body: dict):
@@ -119,28 +132,45 @@ def stream_decode(url: str, body: dict):
     text_parts: list[str] = []
     last_meta: dict       = {}
     usage: dict           = {}
+    line_count = 0
+    max_idle = 60  # max seconds without seeing a token
 
-    with urllib.request.urlopen(req, timeout=500) as resp:
-        for raw in resp:
-            line = raw.decode().strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if payload == "[DONE]":
-                break
-            chunk = json.loads(payload)
-            if chunk.get("usage"):                   # trailing usage chunk
-                usage = chunk["usage"]
-            if not chunk.get("choices"):
-                continue
-            last_meta  = chunk
-            token_text = chunk["choices"][0].get("text", "")
-            if token_text:
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            t_last_chunk = time.perf_counter()
+            for raw in resp:
                 now = time.perf_counter()
-                if t_first is None:
-                    t_first = now
-                t_last = now
-                text_parts.append(token_text)
+                if now - t_last_chunk > max_idle:
+                    print(f"[stream_decode] Timeout waiting for tokens ({now - t_last_chunk:.1f}s idle)",
+                          file=sys.stderr)
+                    break
+
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+
+                line_count += 1
+                chunk = json.loads(payload)
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                if not chunk.get("choices"):
+                    continue
+                last_meta = chunk
+                token_text = chunk["choices"][0].get("text", "")
+                if token_text:
+                    t_last_chunk = now
+                    if t_first is None:
+                        t_first = now
+                    t_last = now
+                    text_parts.append(token_text)
+    except Exception as e:
+        print(f"[stream_decode] Exception: {e}", file=sys.stderr)
+        # Continue with partial results
+        pass
 
     now     = time.perf_counter()
     t_first = t_first or now
@@ -157,7 +187,7 @@ def stream_decode(url: str, body: dict):
         "choices": [{
             "text":          "".join(text_parts),
             "index":         0,
-            "finish_reason": last_meta["choices"][0].get("finish_reason"),
+            "finish_reason": last_meta.get("choices", [{}])[0].get("finish_reason") if last_meta.get("choices") else None,
             "logprobs":      None,
         }],
         "usage": usage,
@@ -202,28 +232,33 @@ class DisaggProxyHandler(BaseHTTPRequestHandler):
 
         uid = str(uuid.uuid4())
         endpoint = f"/v1/completions"
+        prompt_snippet = body.get("prompt", "")[:50]
 
-        # Prefill should only build/send KV cache; avoid long token generation here.
+        # Prefill should only build/send KV cache; do not decode/generate tokens on GPU0.
         prefill_body = {
             **body,
-            "max_tokens": 1,
+            "max_tokens": 0,
             "stream": False,
             "request_id": f"{uid}___decode_addr_{self.decode_zmq}",
         }
         decode_body  = {**body,
                         "request_id": f"{uid}___prefill_addr_{self.prefill_zmq}___"}
 
+        print(f"[Proxy] [uid={uid[:8]}] Starting: '{prompt_snippet[:40]}...'", file=sys.stderr)
         t0 = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             prefill_fut = pool.submit(http_post,
                                       self.prefill_url + endpoint, prefill_body)
             decode_fut  = pool.submit(stream_decode,
                                       self.decode_url  + endpoint, decode_body)
+            print(f"[Proxy] [uid={uid[:8]}] Waiting for decode...", file=sys.stderr)
             response, t_first, t_last, n_tokens = decode_fut.result()
+            print(f"[Proxy] [uid={uid[:8]}] Decode done, n_tokens={n_tokens}", file=sys.stderr)
             # Do not block the client on prefill finishing full generation.
             # Decode completion already implies KV transfer succeeded.
             try:
                 prefill_fut.result(timeout=60)
+                print(f"[Proxy] [uid={uid[:8]}] Prefill done", file=sys.stderr)
             except concurrent.futures.TimeoutError:
                 print("[Proxy] Prefill response still in-flight after decode completion.",
                       file=sys.stderr)
@@ -236,6 +271,8 @@ class DisaggProxyHandler(BaseHTTPRequestHandler):
         response["_decode_time"]   = round(t_last  - t_first, 3)
         response["_total_time"]    = round(t_last  - t0, 3)
         response["_decode_tokens"] = n_tokens
+        print(f"[Proxy] [uid={uid[:8]}] Sending response: prefill={response['_prefill_time']:.3f}s, "
+              f"decode={response['_decode_time']:.3f}s, tokens={n_tokens}", file=sys.stderr)
 
         payload = json.dumps(response).encode()
         self.send_response(200)
@@ -276,6 +313,7 @@ def run_prefill(args):
         "--dtype", "float16",
         "--kv-transfer-config", cfg,
     ]
+    cmd += vllm_mode_args(args.startup_mode)
     if args.quantization:
         cmd += ["--quantization", args.quantization]
     os.execvp("vllm", cmd)
@@ -298,6 +336,7 @@ def run_decode(args):
         "--dtype", "float16",
         "--kv-transfer-config", cfg,
     ]
+    cmd += vllm_mode_args(args.startup_mode)
     if args.quantization:
         cmd += ["--quantization", args.quantization]
     decode_proc = subprocess.Popen(cmd)
@@ -324,6 +363,25 @@ def run_decode(args):
     )
     print(f"[Decode] Disagg proxy listening on port {PROXY_PORT}")
     print(f"[Decode] Prefill ZMQ: {prefill_zmq}  |  Decode ZMQ: {decode_zmq}")
+
+    # Optional warmup: triggers NCCL communicator setup + connector path before
+    # processing user prompts so the first real prompt avoids one-time init cost.
+    if args.warmup:
+        try:
+            warmup_prompt = "warmup"
+            print("[Decode] Running warmup request ...")
+            _ = http_post(
+                f"http://localhost:{PROXY_PORT}/v1/completions",
+                {
+                    "model": args.model,
+                    "prompt": warmup_prompt,
+                    "max_tokens": args.warmup_max_tokens,
+                    "temperature": 0,
+                },
+            )
+            print("[Decode] Warmup complete.")
+        except Exception as exc:
+            print(f"[Decode] Warmup failed (continuing): {exc}", file=sys.stderr)
 
     # Load and process prompts
     prompts = load_prompts(args.prompts_file)
@@ -374,7 +432,9 @@ def run_decode(args):
                 })
 
             except Exception as exc:
+                import traceback
                 print(f"  ERROR: {exc}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
                 results.append({"prompt": prompt, "error": str(exc)})
 
         total_elapsed = time.perf_counter() - total_start
@@ -419,13 +479,28 @@ if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     parser = argparse.ArgumentParser(description="vLLM-based prefill-decode disaggregation")
-    parser.add_argument("--model",         default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model",         default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--quantization",  default=None,
                         help="vLLM quantization method (e.g. awq, gptq, fp8)")
+    parser.add_argument(
+        "--startup-mode",
+        choices=["fast", "balanced", "throughput"],
+        default="fast",
+        help=(
+            "vLLM startup/runtime tradeoff. "
+            "fast skips compile/graph-capture warmup for lower startup latency."
+        ),
+    )
     parser.add_argument("--prompts-file",  default=os.path.join(script_dir, "prompts.txt"),
                         help="Path to a text file with one prompt per line")
-    parser.add_argument("--max-tokens",    type=int, default=1024)
+    parser.add_argument("--max-tokens",    type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--warmup", action="store_true", default=True,
+                        help="Run a tiny warmup request before processing prompts (default: enabled)")
+    parser.add_argument("--no-warmup", action="store_false", dest="warmup",
+                        help="Disable the initial warmup request")
+    parser.add_argument("--warmup-max-tokens", type=int, default=4,
+                        help="Max tokens for warmup request")
     args = parser.parse_args()
 
     rank = int(os.environ.get("SLURM_PROCID", 0))

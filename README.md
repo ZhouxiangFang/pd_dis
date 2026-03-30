@@ -1,24 +1,24 @@
-# Prefill-Decode Disaggregation with Qwen2.5-7B-Instruct
+# Prefill-Decode Disaggregation with Qwen2.5-3B-Instruct
 
 The python version is 3.12. 
 
 There might be a assert error for the P2pNcclConnector. Modification for that in vllm lib is needed.
 
 ## Default Model
-- **Model**: Qwen/Qwen2.5-7B-Instruct (7 billion parameter instruct-tuned model)
+- **Model**: Qwen/Qwen2.5-3B-Instruct (3 billion parameter instruct-tuned model)
 - **Location**: Lines 7-8 in `pd_dis.py`
 
 ## Implementation
 
 #### Prefill Stage (Rank 0)
-1. Loads the Qwen2.5-7B-Instruct model
+1. Loads the Qwen2.5-3B-Instruct model
 2. Tokenizes the input prompt
 3. Performs forward pass to generate KV cache
 4. Transfers KV cache to decode node via NCCL
 5. Measures prefill compute time and transfer time
 
 ### Decode Stage (Rank 1)
-1. Loads the Qwen2.5-7B-Instruct model
+1. Loads the Qwen2.5-3B-Instruct model
 2. Receives KV cache from prefill node
 3. Performs autoregressive token generation using the received KV cache
 4. Generates up to 50 new tokens
@@ -34,6 +34,17 @@ Updated `requirements.txt` includes:
 ## Usage
 ```bash
 sbatch pd_dis.sh
+```
+
+The launcher now defaults to **fast startup mode** in `pd_dis.py`:
+- `--startup-mode fast` (default): lowers startup time by skipping heavy compile/graph warmup.
+- `--warmup` (default): sends one tiny request to pre-initialize NCCL/KV transfer.
+- `--max-tokens 128` (default): avoids very long generations unless explicitly requested.
+
+If you want max steady-state throughput for long runs, pass arguments through `sbatch`:
+
+```bash
+sbatch pd_dis.sh --startup-mode throughput --max-tokens 1024 --no-warmup
 ```
 
 The script will:
