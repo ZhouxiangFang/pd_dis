@@ -203,8 +203,13 @@ class DisaggProxyHandler(BaseHTTPRequestHandler):
         uid = str(uuid.uuid4())
         endpoint = f"/v1/completions"
 
-        prefill_body = {**body,
-                        "request_id": f"{uid}___decode_addr_{self.decode_zmq}"}
+        # Prefill should only build/send KV cache; avoid long token generation here.
+        prefill_body = {
+            **body,
+            "max_tokens": 1,
+            "stream": False,
+            "request_id": f"{uid}___decode_addr_{self.decode_zmq}",
+        }
         decode_body  = {**body,
                         "request_id": f"{uid}___prefill_addr_{self.prefill_zmq}___"}
 
@@ -214,11 +219,16 @@ class DisaggProxyHandler(BaseHTTPRequestHandler):
                                       self.prefill_url + endpoint, prefill_body)
             decode_fut  = pool.submit(stream_decode,
                                       self.decode_url  + endpoint, decode_body)
-            try:
-                prefill_fut.result()       # wait for KV transfer to complete
-            except Exception:
-                pass                       # prefill may timeout; decode still works
             response, t_first, t_last, n_tokens = decode_fut.result()
+            # Do not block the client on prefill finishing full generation.
+            # Decode completion already implies KV transfer succeeded.
+            try:
+                prefill_fut.result(timeout=60)
+            except concurrent.futures.TimeoutError:
+                print("[Proxy] Prefill response still in-flight after decode completion.",
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f"[Proxy] Prefill request error: {exc}", file=sys.stderr)
 
         # t_first = time of first decoded token  (TTFT = prefill + KV transfer)
         # t_last  = time of last  decoded token
