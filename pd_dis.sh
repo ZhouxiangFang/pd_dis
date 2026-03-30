@@ -88,7 +88,18 @@ export PREFILL_HOST=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 # srun launches pd_dis.py on every node (SLURM_PROCID=0 on node 0,
 # SLURM_PROCID=1 on node 1).  Each node runs independently — rank 0
 # starts the prefill vLLM server, rank 1 starts decode + proxy.
+#
+# IMPORTANT: under sbatch, this shell script may execute from Slurm's spool
+# directory (/var/spool/slurmd/job*/). Use SLURM_SUBMIT_DIR so we reference
+# files in the original submit location.
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+SCRIPT_PATH="${SCRIPT_DIR}/pd_dis.py"
 
-srun python3 "${SCRIPT_DIR}/pd_dis.py" "$@"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+	echo "[ERROR] Cannot find ${SCRIPT_PATH}" >&2
+	echo "        Submit from the directory containing pd_dis.py, or update SCRIPT_DIR." >&2
+	exit 1
+fi
+
+srun --chdir "${SCRIPT_DIR}" python3 "${SCRIPT_PATH}" "$@"

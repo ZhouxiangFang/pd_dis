@@ -45,6 +45,7 @@ One prompt per line; lines starting with # and blank lines are ignored.
 """
 
 import argparse
+import functools
 import json
 import os
 import signal
@@ -145,9 +146,29 @@ def find_proxy_script() -> Path:
     sys.exit(1)
 
 
+@functools.lru_cache(maxsize=1)
+def optional_vllm_serve_flags() -> list[str]:
+    """Return optional vLLM serve flags supported by this installed version."""
+    try:
+        probe = subprocess.run(
+            ["vllm", "serve", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        help_text = f"{probe.stdout}\n{probe.stderr}"
+    except FileNotFoundError:
+        return []
+
+    flags: list[str] = []
+    if "--disable-log-requests" in help_text:
+        flags.append("--disable-log-requests")
+    return flags
+
+
 def vllm_cmd(args: argparse.Namespace, port: int) -> list[str]:
     """Build the common vllm serve command (port-agnostic parts)."""
-    return [
+    cmd = [
         "vllm", "serve", args.model,
         "--host",                   "0.0.0.0",
         "--port",                   str(port),
@@ -156,9 +177,10 @@ def vllm_cmd(args: argparse.Namespace, port: int) -> list[str]:
         "--block-size",             str(args.block_size),
         "--dtype",                  "float16",
         "--enforce-eager",
-        "--disable-log-requests",
         "--kv-transfer-config",     KV_CONFIG,
     ]
+    cmd.extend(optional_vllm_serve_flags())
+    return cmd
 
 
 # ---------------------------------------------------------------------------
