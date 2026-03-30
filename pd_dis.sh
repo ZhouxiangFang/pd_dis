@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=commons
-#SBATCH --partition=scavenge
+#SBATCH --partition=commons
 #SBATCH --job-name=pd_disagg
 #SBATCH --time=1:00:00
 #SBATCH --nodes=2
@@ -9,11 +9,13 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --output=../log/pd_disagg_%j.txt
 
-
 # Load the requested CUDA module
 module purge
 module load CUDA/12.4.1
 
+# check nodes: sinfo -o "%20N %15P %20G %10T" | grep -v "down"
+# check account and partition: sacctmgr show associations user=$USER format=User,Account,Partition,QOS
+# check partition: sinfo -o "%20N %15P %20G %10T" | grep "long"
 # Get the hostname of the master node (Prefill Node)
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_PORT=12355
