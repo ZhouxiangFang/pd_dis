@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:lovelace:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH --output=/home/%u/log/pd_disagg_%j.txt
+#SBATCH --output=../log/pd_disagg_%j.txt
 
 
 # Load the requested CUDA module
