@@ -475,7 +475,7 @@ def main() -> None:
         description="vLLM NixlConnector PD disaggregation — two nodes, one GPU each"
     )
     parser.add_argument("--model",                   default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--max-tokens",    type=int, default=128)
+    parser.add_argument("--max-tokens",    type=int, default=1024)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--block-size",    type=int, default=128,
