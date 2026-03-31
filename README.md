@@ -1,55 +1,69 @@
-# Prefill-Decode Disaggregation with Qwen2.5-3B-Instruct
+# Prefill-Decode Disaggregation (vLLM + NixlConnector)
 
-The python version is 3.12. 
+This project runs **2-node disaggregated serving** with one GPU per node:
 
-There might be a assert error for the P2pNcclConnector. Modification for that in vllm lib is needed.
+- **Rank 0 / Node 0**: prefill (`--kv-role kv_producer`) on port `8100`
+- **Rank 1 / Node 1**: decode (`--kv-role kv_consumer`) on port `8200`
 
-## Default Model
-- **Model**: Qwen/Qwen2.5-3B-Instruct (3 billion parameter instruct-tuned model)
-- **Location**: Lines 7-8 in `pd_dis.py`
+It uses **vLLM NixlConnector over UCX** (not NCCL connector flow).
 
-## Implementation
+## Current behavior (important)
 
-#### Prefill Stage (Rank 0)
-1. Loads the Qwen2.5-3B-Instruct model
-2. Tokenizes the input prompt
-3. Performs forward pass to generate KV cache
-4. Transfers KV cache to decode node via NCCL
-5. Measures prefill compute time and transfer time
+- Uses **built-in two-phase prefill → decode** flow in `pd_dis.py`
+- Does **not** depend on `toy_proxy_server.py`
+- Prompts are processed first, then output is reported in this order:
+	1. `SUMMARY`
+	2. per-prompt metrics (including errors)
+	3. `RESPONSES` (final generated text only)
+	4. `AVG METRICS` at the very end
 
-### Decode Stage (Rank 1)
-1. Loads the Qwen2.5-3B-Instruct model
-2. Receives KV cache from prefill node
-3. Performs autoregressive token generation using the received KV cache
-4. Generates up to 50 new tokens
-5. Outputs the complete generated text
+## Metrics reported
+
+For each prompt:
+
+- completion token count
+- **TTFT** (time to first token)
+- **time per output token** (ms/output-token)
+- total time
+
+Global averages at end:
+
+- average TTFT
+- average ms/output-token
+
+## Defaults
+
+From `pd_dis.py`:
+
+- `--model Qwen/Qwen2.5-3B-Instruct`
+- `--max-tokens 1024`
+- `--max-model-len 4096`
+- `--gpu-memory-utilization 0.8`
+- `--block-size 128`
+- `--warmup` enabled by default
 
 ## Requirements
-Updated `requirements.txt` includes:
-- transformers>=4.37.0
-- torch>=2.0.0
-- accelerate>=0.20.0
-- vllm
 
-## Usage
+- Python 3.12
+- vLLM environment available in your conda env
+- Slurm allocation with 2 nodes / 1 GPU per node
+
+UCX/NIXL env setup is handled in `pd_dis.sh`.
+
+## Run
+
 ```bash
 sbatch pd_dis.sh
 ```
 
-The launcher now defaults to **fast startup mode** in `pd_dis.py`:
-- `--startup-mode fast` (default): lowers startup time by skipping heavy compile/graph warmup.
-- `--warmup` (default): sends one tiny request to pre-initialize NCCL/KV transfer.
-- `--max-tokens 128` (default): avoids very long generations unless explicitly requested.
-
-If you want max steady-state throughput for long runs, pass arguments through `sbatch`:
+Pass arguments through `sbatch` to override defaults:
 
 ```bash
-sbatch pd_dis.sh --startup-mode throughput --max-tokens 1024 --no-warmup
+sbatch pd_dis.sh --model Qwen/Qwen2.5-7B-Instruct --max-tokens 256 --no-warmup
 ```
 
-The script will:
-1. Allocate 2 nodes with 1 GPU each
-2. Run prefill on node 0
-3. Run decode on node 1
-4. Transfer KV cache between nodes
-5. Generate text output
+## Files
+
+- `pd_dis.sh`: Slurm launcher + environment setup
+- `pd_dis.py`: prefill/decode orchestration and metrics reporting
+- `prompts.txt`: one prompt per line (`#` comments and blank lines ignored)

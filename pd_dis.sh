@@ -7,12 +7,12 @@
 # ----------------------------------------
 # Node 0  (SLURM_PROCID=0): prefill instance — KV producer, port 8100
 # Node 1  (SLURM_PROCID=1): decode  instance — KV consumer, port 8200
-#                            + proxy (pd_dis.py)             port 8000
+#                            + built-in two-phase prefill→decode client flow
 #
 # srun launches pd_dis.py on BOTH nodes simultaneously.  Each node detects
 # its role from SLURM_PROCID and manages only its own vLLM process.
-# The proxy runs only on the decode node and reaches the prefill node over
-# the network via PREFILL_HOST.
+# Prompt requests are coordinated by rank 1, which reaches prefill over
+# PREFILL_HOST and then decodes locally.
 #
 # KV cache transport
 # ------------------
@@ -25,7 +25,7 @@
 # Side-channel (VLLM_NIXL_SIDE_CHANNEL_*)
 # ----------------------------------------
 # Lightweight TCP socket used ONLY for the initial NIXL handshake.
-# Both nodes point at the prefill node's hostname and side-channel port.
+# Each node binds its own side-channel host with the configured port.
 #
 # Usage
 #   sbatch pd_dis.sh
@@ -87,7 +87,7 @@ export PREFILL_HOST=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 # ---------------------------------------------------------------------------
 # srun launches pd_dis.py on every node (SLURM_PROCID=0 on node 0,
 # SLURM_PROCID=1 on node 1).  Each node runs independently — rank 0
-# starts the prefill vLLM server, rank 1 starts decode + proxy.
+# starts the prefill vLLM server, rank 1 starts decode + built-in client flow.
 #
 # IMPORTANT: under sbatch, this shell script may execute from Slurm's spool
 # directory (/var/spool/slurmd/job*/). Use SLURM_SUBMIT_DIR so we reference
