@@ -16,8 +16,7 @@ Each node detects its role from SLURM_PROCID:
   • Starts vLLM on GPU 0, port 8200, as KV consumer.
     • Binds NIXL side-channel listener on its own hostname.
   • Waits for both vLLM servers to be healthy.
-    • Starts toy_proxy_server.py on port 8000 if available.
-    • Otherwise uses built-in two-phase prefill→decode requests.
+    • Uses built-in two-phase prefill→decode requests.
     • Sends prompts and prints results.
   • On exit, terminates decode vLLM, proxy, and cancels the SLURM job
     (which also terminates rank 0 / the prefill node).
@@ -61,7 +60,6 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 PREFILL_PORT           = 8100
 DECODE_PORT            = 8200
-PROXY_PORT             = 8000
 NIXL_SIDE_CHANNEL_PORT = 5559   # TCP, NIXL handshake only — not the data path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -125,26 +123,68 @@ def http_post(url: str, body: dict, timeout: float = 600) -> dict:
         return json.loads(resp.read())
 
 
-def find_proxy_script() -> Path | None:
-    """Locate toy_proxy_server.py — local copy first, then vLLM package tree."""
-    local = SCRIPT_DIR / "toy_proxy_server.py"
-    if local.exists():
-        return local
-    try:
-        import vllm
-        candidate = (
-            Path(vllm.__file__).parent.parent
-            / "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py"
-        )
-        if candidate.exists():
-            return candidate
-    except ImportError:
-        pass
-    print(
-        "[Proxy] toy_proxy_server.py not found; using built-in direct "
-        "prefill→decode fallback.",
+def http_stream_completion(url: str, body: dict, timeout: float = 600) -> dict:
+    """
+    Stream a /v1/completions request and measure decode-time metrics.
+
+    Returns:
+      {
+        "text": str,
+        "usage": dict,
+        "ttft": float | None,           # seconds to first emitted text chunk
+        "total_time": float,            # total streaming wall time
+      }
+    """
+    stream_body = {
+        **body,
+        "stream": True,
+        # Best effort: include usage in final chunk when supported.
+        "stream_options": {"include_usage": True},
+    }
+
+    data = json.dumps(stream_body).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
     )
-    return None
+
+    t0 = time.perf_counter()
+    ttft = None
+    text_parts: list[str] = []
+    usage: dict = {}
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line or not line.startswith("data:"):
+                continue
+
+            payload_str = line[5:].strip()
+            if not payload_str or payload_str == "[DONE]":
+                continue
+
+            try:
+                payload = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(payload.get("usage"), dict):
+                usage = payload["usage"]
+
+            choices = payload.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                delta_text = choices[0].get("text") or ""
+                if delta_text:
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                    text_parts.append(delta_text)
+
+    total_time = time.perf_counter() - t0
+    return {
+        "text": "".join(text_parts),
+        "usage": usage,
+        "ttft": ttft,
+        "total_time": total_time,
+    }
 
 
 def extract_kv_transfer_params(response: dict) -> dict | None:
@@ -207,7 +247,7 @@ def two_phase_disagg_completion(
             f"Response keys: {sorted(prefill_resp.keys())}"
         )
 
-    return http_post(
+    decode_stream = http_stream_completion(
         f"http://localhost:{DECODE_PORT}/v1/completions",
         {
             "model": model,
@@ -218,6 +258,15 @@ def two_phase_disagg_completion(
         },
         timeout=timeout,
     )
+
+    return {
+        "choices": [{"text": decode_stream["text"]}],
+        "usage": decode_stream["usage"],
+        "metrics": {
+            "ttft": decode_stream["ttft"],
+            "total_time": decode_stream["total_time"],
+        },
+    }
 
 
 @functools.lru_cache(maxsize=1)
@@ -292,9 +341,8 @@ def run_prefill(args: argparse.Namespace, my_host: str) -> None:
 
 def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> None:
     """
-    Launch vLLM as the decode (KV consumer) instance, then start
-    toy_proxy_server when available (or use built-in fallback),
-    process prompts, and clean up.
+    Launch vLLM as the decode (KV consumer) instance, then use the
+    built-in two-phase prefill→decode flow, process prompts, and clean up.
     """
     kv_config = make_kv_config("kv_consumer")
     print(f"[Decode] port={DECODE_PORT}  model={args.model}")
@@ -343,44 +391,19 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
     wait_for_health(prefill_host, PREFILL_PORT, "Prefill")
     wait_for_health("localhost",  DECODE_PORT,  "Decode")
 
-    # ── Start toy_proxy_server if available, else use built-in fallback ──
-    proxy_script = find_proxy_script()
-    use_external_proxy = proxy_script is not None
-
-    if use_external_proxy:
-        proxy_cmd = [
-            sys.executable, str(proxy_script),
-            "--port",            str(PROXY_PORT),
-            "--prefiller-hosts", prefill_host,
-            "--prefiller-ports", str(PREFILL_PORT),
-            "--decoder-hosts",   "localhost",
-            "--decoder-ports",   str(DECODE_PORT),
-        ]
-        print(f"[Proxy] Starting {proxy_script.name} on port {PROXY_PORT} ...")
-        proxy_proc = subprocess.Popen(proxy_cmd)
-        procs.append(proxy_proc)
-        wait_for_health("localhost", PROXY_PORT, "Proxy", poll=1.0, timeout=30.0)
-    else:
-        print("[Proxy] Using built-in two-phase prefill→decode flow.")
+    print("[Flow] Using built-in two-phase prefill→decode flow.")
 
     # ── Optional warmup ───────────────────────────────────────────────────
     if args.warmup:
         print("[Warmup] Sending warmup request ...")
         try:
-            if use_external_proxy:
-                http_post(
-                    f"http://localhost:{PROXY_PORT}/v1/completions",
-                    {"model": args.model, "prompt": "warmup",
-                     "max_tokens": args.warmup_max_tokens, "temperature": 0},
-                )
-            else:
-                two_phase_disagg_completion(
-                    model=args.model,
-                    prompt="warmup",
-                    max_tokens=args.warmup_max_tokens,
-                    temperature=0,
-                    prefill_host=prefill_host,
-                )
+            two_phase_disagg_completion(
+                model=args.model,
+                prompt="warmup",
+                max_tokens=args.warmup_max_tokens,
+                temperature=0,
+                prefill_host=prefill_host,
+            )
             print("[Warmup] Done.")
         except Exception as exc:
             print(f"[Warmup] Warning: {exc} (continuing)", file=sys.stderr)
@@ -393,51 +416,43 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
     wall_start = time.perf_counter()
 
     for idx, prompt in enumerate(prompts, 1):
-        print(f"\n{'='*60}")
-        print(f"  Prompt {idx}/{len(prompts)}")
-        print(f"{'='*60}")
-        print(f"  Input  : {prompt}")
+        print(f"[Decode] Processing prompt {idx}/{len(prompts)} ...")
 
-        t0 = time.perf_counter()
         try:
-            if use_external_proxy:
-                response = http_post(
-                    f"http://localhost:{PROXY_PORT}/v1/completions",
-                    {"model": args.model, "prompt": prompt,
-                     "max_tokens": args.max_tokens, "temperature": 0},
-                )
-            else:
-                response = two_phase_disagg_completion(
-                    model=args.model,
-                    prompt=prompt,
-                    max_tokens=args.max_tokens,
-                    temperature=0,
-                    prefill_host=prefill_host,
-                )
-            t1 = time.perf_counter()
+            response = two_phase_disagg_completion(
+                model=args.model,
+                prompt=prompt,
+                max_tokens=args.max_tokens,
+                temperature=0,
+                prefill_host=prefill_host,
+            )
 
             usage      = response.get("usage", {})
             output     = response["choices"][0]["text"]
-            total_t    = t1 - t0
-            n_compl    = usage.get("completion_tokens")
-            ms_per_tok = (total_t / n_compl * 1000) if n_compl else None
+            metrics = response.get("metrics", {})
+            total_t = metrics.get("total_time")
+            ttft    = metrics.get("ttft")
 
-            print(f"  Output : {output}")
-            print(f"  Tokens : prompt={usage.get('prompt_tokens')}  "
-                  f"completion={usage.get('completion_tokens')}")
-            print(f"  Total  : {total_t:.3f}s", end="")
-            if ms_per_tok is not None:
-                print(f"  |  {ms_per_tok:.1f} ms/tok  |  {1000/ms_per_tok:.1f} tok/s")
-            else:
-                print()
+            n_compl = usage.get("completion_tokens")
+            count_is_estimate = False
+            if not n_compl:
+                # Fallback when streaming usage is unavailable.
+                n_compl = len(output.split())
+                count_is_estimate = True
+
+            ms_per_tok = (total_t / n_compl * 1000) if (total_t and n_compl) else None
 
             results.append({"prompt": prompt, "output": output,
-                             "usage": usage, "total_time": total_t,
+                             "usage": usage,
+                             "total_time": total_t,
+                             "ttft": ttft,
+                             "completion_tokens": n_compl,
+                             "completion_tokens_estimated": count_is_estimate,
                              "ms_per_token": ms_per_tok})
 
         except Exception as exc:
             import traceback
-            print(f"  ERROR: {exc}", file=sys.stderr)
+            print(f"[Decode] ERROR on prompt {idx}: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
             results.append({"prompt": prompt, "error": str(exc)})
 
@@ -447,21 +462,68 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
     print(f"\n{'='*60}")
     print(f"  SUMMARY  ({len(results)} prompts, wall-clock {wall_elapsed:.3f}s)")
     print(f"{'='*60}")
+
+    ok = [r for r in results if "error" not in r]
+    mean_ttft_vals = [r["ttft"] for r in ok if r.get("ttft") is not None]
+    mean_tpot_vals = [r["ms_per_token"] for r in ok if r.get("ms_per_token") is not None]
+
+    print("\n  Per-prompt metrics:")
+    for j, r in enumerate(results, 1):
+        if "error" in r:
+            print(f"    [{j}] ERROR | prompt='{r['prompt']}' | msg={r['error']}")
+            continue
+
+        ttft = r.get("ttft")
+        ttft_s = f"{ttft:.3f}s" if ttft is not None else "n/a"
+        tpot = r.get("ms_per_token")
+        tpot_s = f"{tpot:.1f}ms" if tpot is not None else "n/a"
+        c_tok = r.get("completion_tokens")
+        est = " (est.)" if r.get("completion_tokens_estimated") else ""
+        total_t = r.get("total_time")
+        total_s = f"{total_t:.3f}s" if total_t is not None else "n/a"
+        print(
+            f"    [{j}] OK    | prompt='{r['prompt']}' | "
+            f"completion={c_tok}{est} | ttft={ttft_s} | tpot={tpot_s} | total={total_s}"
+        )
+
     for j, r in enumerate(results, 1):
         print(f"\n  [{j}] Input : {r['prompt']}")
         if "error" in r:
             print(f"      Error : {r['error']}")
         else:
             u = r["usage"]
-            print(f"      Output: {r['output']}")
             print(f"      Tokens: prompt={u.get('prompt_tokens')}  "
-                  f"completion={u.get('completion_tokens')}")
+                  f"completion={r.get('completion_tokens')}"
+                  f"{' (est.)' if r.get('completion_tokens_estimated') else ''}")
+            if r.get("ttft") is not None:
+                print(f"      TTFT  : {r['ttft']:.3f}s")
             print(f"      Time  : {r['total_time']:.3f}s", end="")
             if r["ms_per_token"] is not None:
-                print(f"  |  {r['ms_per_token']:.1f} ms/tok  "
-                      f"|  {1000/r['ms_per_token']:.1f} tok/s")
+                print(f"  |  {r['ms_per_token']:.1f} ms/output-token")
             else:
                 print()
+
+    print(f"\n{'='*60}")
+    print("  RESPONSES")
+    print(f"{'='*60}")
+    for j, r in enumerate(results, 1):
+        print(f"\n  [{j}] Input : {r['prompt']}")
+        if "error" in r:
+            print(f"      Error : {r['error']}")
+        else:
+            print(f"      Output: {r['output']}")
+
+    print(f"\n{'='*60}")
+    print("  AVG METRICS")
+    print(f"{'='*60}")
+    if mean_ttft_vals:
+        print(f"  Avg TTFT           : {sum(mean_ttft_vals)/len(mean_ttft_vals):.3f}s")
+    else:
+        print("  Avg TTFT           : n/a")
+    if mean_tpot_vals:
+        print(f"  Avg ms/output-token: {sum(mean_tpot_vals)/len(mean_tpot_vals):.1f} ms")
+    else:
+        print("  Avg ms/output-token: n/a")
 
     cleanup()
 
