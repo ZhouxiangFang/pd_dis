@@ -57,11 +57,20 @@ set -euo pipefail
 module purge
 module load CUDA/12.4.1
 
-CONDA_ENV=/scratch/$USER/comp529/miniconda3/envs/nlp
+# Locate conda env and HF cache. Prefer the current user's scratch if it
+# has the env, otherwise fall back to the shared team location under zf28.
+_COMP529_USER_ROOT="/scratch/$USER/comp529"
+_COMP529_SHARED_ROOT="/scratch/zf28/comp529"
+if [[ -d "$_COMP529_USER_ROOT/miniconda3/envs/nlp" ]]; then
+    _COMP529_ROOT="$_COMP529_USER_ROOT"
+else
+    _COMP529_ROOT="$_COMP529_SHARED_ROOT"
+fi
+CONDA_ENV="$_COMP529_ROOT/miniconda3/envs/nlp"
 export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 
-export HF_HOME=/scratch/$USER/comp529/cache
+export HF_HOME="$_COMP529_ROOT/cache"
 
 # Suppress XALT executable tracking (injects a stale libcrypto into LD_PRELOAD)
 export XALT_EXECUTABLE_TRACKING=no

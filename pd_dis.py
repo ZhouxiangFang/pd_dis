@@ -44,6 +44,8 @@ Read from prompts.txt (same directory as this script).
 One prompt per line; lines starting with # and blank lines are ignored.
 """
 
+from __future__ import annotations
+
 import argparse
 import functools
 import json
@@ -54,6 +56,8 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+from methods.attn_pruning import PruneConfig, prune_prompt
 
 # ---------------------------------------------------------------------------
 # Ports & constants
@@ -221,6 +225,7 @@ def two_phase_disagg_completion(
       1) prefill on node 0 with do_remote_decode=True
       2) decode on node 1 with returned kv_transfer_params
     """
+    _t_prefill_start = time.perf_counter()
     prefill_resp = http_post(
         f"http://{prefill_host}:{PREFILL_PORT}/v1/completions",
         {
@@ -232,6 +237,7 @@ def two_phase_disagg_completion(
         },
         timeout=timeout,
     )
+    prefill_http_time = time.perf_counter() - _t_prefill_start
 
     kv_params = extract_kv_transfer_params(prefill_resp)
     if not kv_params:
@@ -265,6 +271,7 @@ def two_phase_disagg_completion(
         "metrics": {
             "ttft": decode_stream["ttft"],
             "total_time": decode_stream["total_time"],
+            "prefill_http_time": prefill_http_time,
         },
     }
 
@@ -350,6 +357,17 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
     print(f"[Decode] Prefill node: {prefill_host}:{PREFILL_PORT}")
     print(f"[Decode] NIXL side-channel bind: {my_host}:{NIXL_SIDE_CHANNEL_PORT}")
     print(f"[Decode] KV config: {kv_config}")
+    prune_cfg = PruneConfig(
+        method=args.pruning_method,
+        keep_ratio=args.pruning_keep_ratio,
+        min_tokens=args.pruning_min_tokens,
+        seed=args.pruning_seed,
+    )
+    print(
+        "[Decode] Pruning config: "
+        f"method={prune_cfg.method}, keep_ratio={prune_cfg.keep_ratio:.2f}, "
+        f"min_tokens={prune_cfg.min_tokens}, seed={prune_cfg.seed}"
+    )
 
     decode_env = {
         **os.environ,
@@ -417,11 +435,27 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
 
     for idx, prompt in enumerate(prompts, 1):
         print(f"[Decode] Processing prompt {idx}/{len(prompts)} ...")
+        prune_result = prune_prompt(prompt, prune_cfg)
+        if prune_result.applied:
+            reduction = 1.0 - (prune_result.kept_tokens / prune_result.original_tokens)
+            print(
+                f"[Prune] [{idx}] method={prune_result.method} "
+                f"orig_tokens={prune_result.original_tokens} "
+                f"kept_tokens={prune_result.kept_tokens} "
+                f"reduction={reduction:.2%}"
+            )
+        else:
+            print(
+                f"[Prune] [{idx}] method={prune_result.method} "
+                f"orig_tokens={prune_result.original_tokens} "
+                f"kept_tokens={prune_result.kept_tokens} "
+                "reduction=0.00%"
+            )
 
         try:
             response = two_phase_disagg_completion(
                 model=args.model,
-                prompt=prompt,
+                prompt=prune_result.text,
                 max_tokens=args.max_tokens,
                 temperature=0,
                 prefill_host=prefill_host,
@@ -432,6 +466,7 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
             metrics = response.get("metrics", {})
             total_t = metrics.get("total_time")
             ttft    = metrics.get("ttft")
+            prefill_t = metrics.get("prefill_http_time")
 
             n_compl = usage.get("completion_tokens")
             count_is_estimate = False
@@ -443,9 +478,13 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
             ms_per_tok = (total_t / n_compl * 1000) if (total_t and n_compl) else None
 
             results.append({"prompt": prompt, "output": output,
+                             "prompt_after_pruning": prune_result.text,
+                             "prompt_tokens_before_pruning": prune_result.original_tokens,
+                             "prompt_tokens_after_pruning": prune_result.kept_tokens,
                              "usage": usage,
                              "total_time": total_t,
                              "ttft": ttft,
+                             "prefill_http_time": prefill_t,
                              "completion_tokens": n_compl,
                              "completion_tokens_estimated": count_is_estimate,
                              "ms_per_token": ms_per_tok})
@@ -481,9 +520,12 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
         est = " (est.)" if r.get("completion_tokens_estimated") else ""
         total_t = r.get("total_time")
         total_s = f"{total_t:.3f}s" if total_t is not None else "n/a"
+        prefill_t = r.get("prefill_http_time")
+        prefill_s = f"{prefill_t:.3f}s" if prefill_t is not None else "n/a"
         print(
             f"    [{j}] OK    | prompt='{r['prompt']}' | "
-            f"completion={c_tok}{est} | ttft={ttft_s} | tpot={tpot_s} | total={total_s}"
+            f"completion={c_tok}{est} | ttft={ttft_s} | tpot={tpot_s} | "
+            f"total={total_s} | prefill={prefill_s}"
         )
 
     for j, r in enumerate(results, 1):
@@ -550,7 +592,34 @@ def main() -> None:
     parser.add_argument("--no-warmup", action="store_false", dest="warmup",
                         help="Disable the warmup request")
     parser.add_argument("--warmup-max-tokens", type=int, default=4)
+    parser.add_argument(
+        "--pruning-method",
+        choices=["none", "attn_proxy", "random"],
+        default="none",
+        help="Prompt-side pruning mode for method-2 experiments.",
+    )
+    parser.add_argument(
+        "--pruning-keep-ratio",
+        type=float,
+        default=1.0,
+        help="Fraction of tokens kept by the pruner (0.0-1.0).",
+    )
+    parser.add_argument(
+        "--pruning-min-tokens",
+        type=int,
+        default=0,
+        help="Only prune prompts with at least this many tokens "
+             "(0 = always prune when method != none).",
+    )
+    parser.add_argument(
+        "--pruning-seed",
+        type=int,
+        default=42,
+        help="Random seed used when pruning method is random.",
+    )
     args = parser.parse_args()
+    if not (0.0 <= args.pruning_keep_ratio <= 1.0):
+        parser.error("--pruning-keep-ratio must be in [0.0, 1.0]")
 
     # SLURM_PROCID is set by srun on every task: 0 on node 0, 1 on node 1.
     rank = int(os.environ.get("SLURM_PROCID", 0))
