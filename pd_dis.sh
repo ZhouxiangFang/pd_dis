@@ -69,6 +69,9 @@ set -euo pipefail
 # Environment setup  (runs on the submission node before srun)
 # ---------------------------------------------------------------------------
 module purge
+# GCC must load BEFORE CUDA so flashinfer's JIT compile (triggered by
+# --kv-cache-dtype fp8_*) can find cc1plus on the compute node.
+module load GCC/13.2.0
 module load CUDA/12.4.1
 
 # Locate conda env and HF cache. Prefer the current user's scratch if it
@@ -85,6 +88,9 @@ export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 
 export HF_HOME="$_COMP529_ROOT/cache"
+# Redirect flashinfer / torch / triton JIT caches off HOME (10 GB quota).
+mkdir -p "/scratch/$USER/comp529/cache_local" 2>/dev/null
+export XDG_CACHE_HOME="/scratch/$USER/comp529/cache_local"
 
 # Suppress XALT executable tracking (injects a stale libcrypto into LD_PRELOAD)
 export XALT_EXECUTABLE_TRACKING=no

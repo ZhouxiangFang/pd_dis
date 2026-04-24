@@ -70,10 +70,18 @@ from methods.attn_pruning import PruneConfig, prune_prompt
 
 # ---------------------------------------------------------------------------
 # Ports & constants
+#
+# SLURM may pack concurrent jobs onto the same compute node (an L40S node has
+# 4 GPUs; many 1-GPU jobs share a node). Hardcoded ports collide in that
+# case. Offsets from SLURM_JOB_ID keep concurrent jobs disjoint; SLURM_PROCID
+# keeps the two ranks of a single 1-node 2-GPU job from colliding on the NIXL
+# side-channel port.
 # ---------------------------------------------------------------------------
-PREFILL_PORT           = 8100
-DECODE_PORT            = 8200
-NIXL_SIDE_CHANNEL_PORT = 5559   # TCP, NIXL handshake only — not the data path
+_JOB_OFFSET  = int(os.environ.get("SLURM_JOB_ID", "0")) % 1000
+_RANK_OFFSET = int(os.environ.get("SLURM_PROCID", "0")) * 10
+PREFILL_PORT           = 18000 + _JOB_OFFSET                    # one bind per role
+DECODE_PORT            = 19000 + _JOB_OFFSET
+NIXL_SIDE_CHANNEL_PORT = 25000 + _JOB_OFFSET + _RANK_OFFSET     # per-rank listener
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -520,6 +528,7 @@ def vllm_cmd(args: argparse.Namespace, port: int, kv_config: str) -> list[str]:
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--block-size",             str(args.block_size),
         "--dtype",                  "float16",
+        "--kv-cache-dtype",         args.kv_cache_dtype,
         "--kv-transfer-config",     kv_config,
     ]
     cmd.extend(optional_vllm_serve_flags())
@@ -536,12 +545,17 @@ def run_prefill(args: argparse.Namespace, my_host: str) -> None:
     print(f"[Prefill] NIXL side-channel: {my_host}:{NIXL_SIDE_CHANNEL_PORT}")
     print(f"[Prefill] KV config: {kv_config}")
 
-    os.environ.update({
-        "CUDA_VISIBLE_DEVICES":        "0",
+    # GPU selection: 2-node 1-GPU sees only its own GPU as device 0; in
+    # 1-node 2-GPU mode SLURM assigns each task its own CUDA_VISIBLE_DEVICES.
+    # Don't stomp on SLURM's assignment.
+    env_update = {
         "VLLM_KV_CACHE_LAYOUT":        "HND",
         "VLLM_NIXL_SIDE_CHANNEL_HOST": my_host,
         "VLLM_NIXL_SIDE_CHANNEL_PORT": str(NIXL_SIDE_CHANNEL_PORT),
-    })
+    }
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        env_update["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ.update(env_update)
 
     cmd = vllm_cmd(args, PREFILL_PORT, kv_config)
     os.execvp(cmd[0], cmd)
@@ -576,11 +590,12 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
 
     decode_env = {
         **os.environ,
-        "CUDA_VISIBLE_DEVICES":        "0",
         "VLLM_KV_CACHE_LAYOUT":        "HND",
         "VLLM_NIXL_SIDE_CHANNEL_HOST": my_host,
         "VLLM_NIXL_SIDE_CHANNEL_PORT": str(NIXL_SIDE_CHANNEL_PORT),
     }
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        decode_env["CUDA_VISIBLE_DEVICES"] = "0"
 
     decode_proc = subprocess.Popen(vllm_cmd(args, DECODE_PORT, kv_config), env=decode_env)
     procs = [decode_proc]
@@ -957,8 +972,18 @@ def main() -> None:
                              "model's max_position_embeddings (32,768 for Qwen3-4B).")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--block-size",    type=int, default=1024,
-                        help="KV cache block size in tokens "
-                             "(larger = fewer transfer round-trips)")
+                        help="KV cache block size in tokens — also the unit at "
+                             "which NixlConnector transfers KV. Smaller = more "
+                             "transfer/compute overlap (pipelining knob).")
+    parser.add_argument("--kv-cache-dtype",
+                        choices=("auto", "float16", "bfloat16",
+                                 "fp8", "fp8_e4m3", "fp8_e5m2"),
+                        default="auto",
+                        help="vLLM KV cache storage dtype. 'auto' = model dtype "
+                             "(fp16 here). 'fp8_e5m2' / 'fp8_e4m3' = 2x compression "
+                             "on the wire via NIXL (KV IS fp8 in memory → NIXL ships "
+                             "fp8 bytes, no extra code needed). Requires GCC module "
+                             "loaded for flashinfer JIT (see pd_dis.sh).")
     parser.add_argument("--prompts-file",  type=Path,
                         default=SCRIPT_DIR / "prompts.txt")
     parser.add_argument("--warmup",    action="store_true",  default=True,

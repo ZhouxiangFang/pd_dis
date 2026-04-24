@@ -49,12 +49,18 @@ echo "[sweep] tag=$TAG  repeats=$REPEATS  results=$RESULTS_DIR"
 # Keep prompt+output+safety_margin <= max_model_len.
 # long_ctx deliberately sized under 4096 so default vLLM config works.
 # -----------------------------------------------------------------------------
-WORKLOADS=(
-  "short          256   128   4096"
-  "prompt_heavy  1500   128   4096"
-  "gen_heavy      256   512   4096"
-  "long_ctx      2500   256   4096"
-)
+# Default 4-workload matrix. Override via WORKLOADS env var (one per line):
+#   WORKLOADS=$'prompt_heavy 1500 128 4096\nlong_ctx 2500 256 4096' ./run_sweep.sh 1 -- ...
+if [ -n "${WORKLOADS:-}" ]; then
+    mapfile -t WORKLOADS <<< "$WORKLOADS"
+else
+    WORKLOADS=(
+      "short          256   128   4096"
+      "prompt_heavy  1500   128   4096"
+      "gen_heavy      256   512   4096"
+      "long_ctx      2500   256   4096"
+    )
+fi
 N_PROMPTS="${N_PROMPTS:-16}"
 
 # -----------------------------------------------------------------------------

@@ -138,4 +138,125 @@ The summary CSV contains all aggregate metrics (TTFT mean/p50/p95/p99, E2E, pref
 - `pd_dis.py` — prefill/decode orchestration, dataset loading, metrics reporting
 - `prompts.txt` — custom prompts used when `--dataset none` (one per line, `#` for comments)
 - `methods/` — prompt pruning implementations (`attn_proxy`, `random`)
+- `eval/` — sweep drivers + result aggregators (see below)
 - `results/` — CSV output directory (created automatically)
+
+---
+
+## Compression and pipelining sweeps
+
+`--kv-cache-dtype` and `--block-size` are the two knobs that control the
+compression and pipelining optimization axes from the proposal. Each is a
+plain passthrough to `vllm serve` and works with the default NixlConnector
+path — no LMCache / CacheGen needed.
+
+| Flag | Default | Values | What it does |
+|---|---|---|---|
+| `--kv-cache-dtype` | `auto` (fp16) | `auto`, `fp8_e5m2`, `fp8_e4m3` | Stores KV cache in fp8. NixlConnector ships fp8 bytes over UCX → ~2× on-wire compression. Costs ~1 ms/output-token of dequant in attention kernels. |
+| `--block-size` | `1024` | any power-of-2 in `[16, 2048]` | vLLM KV paging unit AND NIXL transfer granularity. Smaller = more transfer/compute overlap (pipelining) but higher per-transfer overhead. |
+
+> **Note (fp8 path prerequisite):** fp8 triggers flashinfer JIT compilation of
+> attention kernels, which requires `cc1plus`. `pd_dis.sh` loads `GCC/13.2.0`
+> and `CUDA/12.4.1` before running; the flashinfer cache is redirected to
+> `/scratch/$USER/comp529/cache_local` to avoid HOME quota pressure.
+
+### Single-run examples
+
+```bash
+# Baseline (fp16 KV, block-size 1024) — same as the vanilla commands above.
+sbatch pd_dis.sh --dataset aime25 --max-tokens 16384
+
+# Compression only
+sbatch pd_dis.sh --dataset aime25 --max-tokens 16384 --kv-cache-dtype fp8_e5m2
+
+# Pipelining only (smaller blocks = more transfer/compute overlap)
+sbatch pd_dis.sh --dataset aime25 --max-tokens 16384 --block-size 128
+
+# Combined
+sbatch pd_dis.sh --dataset lveval --dataset-len 16k --max-tokens 512 \
+                 --kv-cache-dtype fp8_e5m2 --block-size 128
+```
+
+### Ready-to-run sweep scripts
+
+Under `eval/` there are two drivers that submit one sbatch job per cell
+and collect the results into one directory. Each cell writes its own
+`summary_*.csv` + `per_prompt_*.csv`, plus a `manifest.tsv` for the sweep.
+
+#### `eval/sweep_compression.sh` — fp8_e5m2 vs fp16 on both datasets
+
+```bash
+# 4 jobs: (aime25, lveval) × (baseline, fp8_e5m2), 30 samples each
+./eval/sweep_compression.sh
+
+# Only one dataset
+./eval/sweep_compression.sh aime25
+./eval/sweep_compression.sh lveval
+
+# Override sample count / LVEval context bucket
+N_SAMPLES=50 ./eval/sweep_compression.sh
+LVEVAL_LEN=32k ./eval/sweep_compression.sh lveval
+```
+
+#### `eval/sweep_pipelining.sh` — block-size sweep on both datasets
+
+```bash
+# 12 jobs: (aime25, lveval) × block_size ∈ {16, 32, 64, 128, 256, 1024}
+./eval/sweep_pipelining.sh
+
+# Only AIME25
+./eval/sweep_pipelining.sh aime25
+
+# Custom sweep
+BLOCK_SIZES="128 256 1024" ./eval/sweep_pipelining.sh lveval
+```
+
+Each sweep script writes to `eval/results/compression_<ts>/` or
+`eval/results/pipelining_<ts>/`, with one sub-directory per cell and a
+`jobs.txt` for bulk cancel:
+
+```bash
+# Watch all jobs from a sweep
+squeue -u $USER -j $(paste -sd, eval/results/compression_*/jobs.txt)
+
+# Cancel them
+scancel $(cat eval/results/compression_<ts>/jobs.txt)
+```
+
+#### Aggregate results
+
+```bash
+# Combine every summary_*.csv in a sweep directory into one markdown table + CSV
+python3 eval/collect_summaries.py eval/results/compression_20260423_153805
+
+# Pick which columns to include in the markdown table
+python3 eval/collect_summaries.py eval/results/pipelining_20260423_153805 \
+    --columns dataset tag ttft_mean ttft_p99 e2e_mean tpot_mean_ms accuracy
+```
+
+Combine compression + pipelining + baseline into one view:
+
+```bash
+mkdir -p eval/results/combined_all
+for d in eval/results/compression_*/eval/results/pipelining_*/; do
+    cp -r "$d"* eval/results/combined_all/
+done
+python3 eval/collect_summaries.py eval/results/combined_all
+```
+
+### Interpreting the trade-offs
+
+Both axes are **trade-offs, not strict wins**:
+
+- **Compression (fp8_e5m2)** — KV storage halves, on-wire transfer halves,
+  but attention pays fp8 dequant per-decode-token. Net-positive for TTFT
+  on prompt-heavy workloads (transfer-dominated); often net-negative for
+  end-to-end throughput on decode-heavy workloads.
+- **Pipelining (smaller `--block-size`)** — more chunks = more
+  transfer/decode overlap, but more NIXL round-trips. Sweet spot is
+  workload-dependent; empirically `block_size=32` looked best for
+  long-context prompt-heavy Qwen2.5-3B at 2500-token context, while
+  `block_size=256` minimized E2E for 1500-token context.
+
+See [notes/tabs/2026-04-23_pd-dis-compression-pipelining.md](notes/tabs/2026-04-23_pd-dis-compression-pipelining.md)
+for the full measurement table on the prior-generation synthetic workloads.
