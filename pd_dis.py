@@ -38,23 +38,32 @@ PREFILL_HOST
 Set by pd_dis.sh before srun and exported into the environment of both tasks:
   export PREFILL_HOST=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 
-Prompts
-───────
-Read from prompts.txt (same directory as this script).
-One prompt per line; lines starting with # and blank lines are ignored.
+Prompts / Dataset
+─────────────────
+When --dataset is "none" (default): read from prompts.txt (same directory).
+When --dataset is "lveval":  load Infinigence/LVEval (sample --dataset-n-samples
+  instances with seed --dataset-seed) and compute F1 accuracy.
+When --dataset is "aime25":  load math-ai/aime25 and compute exact-match accuracy.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
 import functools
 import json
 import os
+import random
+import re
 import signal
+import socket
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 from methods.attn_pruning import PruneConfig, prune_prompt
@@ -68,11 +77,12 @@ NIXL_SIDE_CHANNEL_PORT = 5559   # TCP, NIXL handshake only — not the data path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+LVEVAL_HF_NAME      = "Infinigence/LVEval"
+AIME25_HF_NAME      = "math-ai/aime25"
+LVEVAL_DEFAULT_SUBSET = "hotpotqa_en"
+
 # ---------------------------------------------------------------------------
 # NixlConnector KV-transfer config
-#   kv_role: prefill="kv_producer", decode="kv_consumer"
-#            (important for vLLM>=0.18 NIXL side-channel behavior)
-#   kv_buffer_device="cuda" — keep transfer buffer in GPU VRAM (faster)
 # ---------------------------------------------------------------------------
 def make_kv_config(kv_role: str) -> str:
     return json.dumps({
@@ -83,7 +93,7 @@ def make_kv_config(kv_role: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers — prompts
 # ---------------------------------------------------------------------------
 
 def load_prompts(path: Path) -> list[str]:
@@ -100,6 +110,210 @@ def load_prompts(path: Path) -> list[str]:
         sys.exit(1)
     return prompts
 
+
+# ---------------------------------------------------------------------------
+# Helpers — statistics
+# ---------------------------------------------------------------------------
+
+def percentile(xs: list[float], p: float) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    k = (len(s) - 1) * p / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _fmt_s(v: float | None, prec: int = 3) -> str:
+    return f"{v:.{prec}f}s" if v is not None else "n/a"
+
+
+def _fmt_ms(v: float | None) -> str:
+    return f"{v:.1f}ms" if v is not None else "n/a"
+
+
+# ---------------------------------------------------------------------------
+# Helpers — dataset loading
+# ---------------------------------------------------------------------------
+
+def _hf_load_dataset(name: str, *args, **kwargs):
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print(
+            "[ERROR] 'datasets' package not found.\n"
+            "        Install it: pip install datasets",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return load_dataset(name, *args, **kwargs)
+
+
+def load_dataset_items(
+    dataset: str,
+    subset: str | None,
+    n_samples: int,
+    seed: int,
+) -> list[dict]:
+    """
+    Load evaluation items from a HuggingFace dataset.
+
+    Returns list of dicts:
+      {
+        "prompt":        str,           # full prompt sent to vLLM
+        "prompt_display": str,          # ≤80-char version for logs
+        "ground_truth":  str | list,   # reference answer(s)
+      }
+    """
+    rng = random.Random(seed)
+
+    if dataset == "lveval":
+        cfg = subset or LVEVAL_DEFAULT_SUBSET
+        print(f"[Dataset] Loading {LVEVAL_HF_NAME} subset={cfg} ...")
+        ds = _hf_load_dataset(LVEVAL_HF_NAME, cfg, split="test")
+        indices = list(range(len(ds)))
+        rng.shuffle(indices)
+        selected = indices[:min(n_samples, len(ds))]
+        items = []
+        for i in selected:
+            ex = ds[i]
+            context  = ex.get("context", "")
+            question = ex.get("input", "")
+            prompt = (
+                f"{context}\n\n"
+                f"Based on the above text, answer the following question briefly.\n"
+                f"Question: {question}\nAnswer:"
+            )
+            gts = ex.get("output", [])
+            if isinstance(gts, str):
+                gts = [gts]
+            items.append({
+                "prompt":         prompt,
+                "prompt_display": question[:80].replace("\n", " ").replace("'", " "),
+                "ground_truth":   gts,
+            })
+        print(f"[Dataset] Loaded {len(items)} items from LVEval/{cfg}.")
+        return items
+
+    elif dataset == "aime25":
+        print(f"[Dataset] Loading {AIME25_HF_NAME} ...")
+        ds = None
+        for split in ("train", "test", "validation"):
+            try:
+                ds = _hf_load_dataset(AIME25_HF_NAME, split=split)
+                break
+            except Exception:
+                continue
+        if ds is None:
+            ds_dict = _hf_load_dataset(AIME25_HF_NAME)
+            ds = ds_dict[next(iter(ds_dict))]
+
+        indices = list(range(len(ds)))
+        rng.shuffle(indices)
+        selected = indices[:min(n_samples, len(ds))]
+        items = []
+        for i in selected:
+            ex    = ds[i]
+            prob  = ex.get("problem", ex.get("question", ""))
+            ans   = str(ex.get("answer", ""))
+            prompt = (
+                "Solve the following competition math problem. "
+                r"Show your work, then put your final integer answer inside \boxed{}."
+                "\n\n"
+                f"Problem: {prob}"
+            )
+            items.append({
+                "prompt":         prompt,
+                "prompt_display": prob[:80].replace("\n", " ").replace("'", " "),
+                "ground_truth":   ans,
+            })
+        print(f"[Dataset] Loaded {len(items)} items from AIME25.")
+        return items
+
+    else:
+        print(f"[ERROR] Unknown dataset: {dataset}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — answer extraction and scoring
+# ---------------------------------------------------------------------------
+
+def extract_answer_aime(text: str) -> str | None:
+    r"""Extract the final integer answer (0-999) from model output."""
+    # \boxed{N}
+    m = re.search(r'\\boxed\{(\d+)\}', text)
+    if m:
+        return m.group(1)
+    # "the answer is N" / "answer: N" / "answer = N"
+    m = re.search(
+        r'(?:the\s+answer\s+is|answer\s*[:=])\s*(\d{1,3})\b',
+        text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    # last 1–3 digit number (AIME answers are 0–999)
+    nums = re.findall(r'\b(\d{1,3})\b', text)
+    return nums[-1] if nums else None
+
+
+def f1_score_tokens(pred: str, ref: str) -> float:
+    """Token-level F1 between prediction and reference strings."""
+    p_toks = pred.lower().split()
+    r_toks = ref.lower().split()
+    if not p_toks or not r_toks:
+        return 0.0
+    common = Counter(p_toks) & Counter(r_toks)
+    num = sum(common.values())
+    if num == 0:
+        return 0.0
+    prec = num / len(p_toks)
+    rec  = num / len(r_toks)
+    return 2 * prec * rec / (prec + rec)
+
+
+def score_result(
+    output: str,
+    ground_truth,
+    dataset: str,
+) -> tuple[float, str | None]:
+    """
+    Returns (score, extracted_answer).
+      aime25: 1.0 if extracted integer matches reference, else 0.0
+      lveval:  best token-F1 over all ground truth strings
+    """
+    if dataset == "aime25":
+        extracted = extract_answer_aime(output)
+        if extracted is None:
+            return 0.0, None
+        ref = ground_truth[0] if isinstance(ground_truth, (list, tuple)) else str(ground_truth)
+        try:
+            score = 1.0 if int(extracted) == int(ref) else 0.0
+        except (ValueError, TypeError):
+            score = 1.0 if extracted.strip() == ref.strip() else 0.0
+        return score, extracted
+
+    elif dataset == "lveval":
+        # The prompt ends with "Answer:" so the model's answer is the text that
+        # follows. Strip any chain-of-thought that precedes "Answer:" in the
+        # output (some models repeat the cue before answering).
+        answer_marker = re.search(r'[Aa]nswer\s*:\s*', output)
+        if answer_marker:
+            extracted = output[answer_marker.end():].strip()
+        else:
+            extracted = output.strip()
+        # Keep only the first sentence/line — LVEval answers are short phrases.
+        extracted = re.split(r'[\n.。]', extracted)[0].strip()[:200]
+        refs = ground_truth if isinstance(ground_truth, (list, tuple)) else [str(ground_truth)]
+        score = max((f1_score_tokens(extracted, r) for r in refs), default=0.0)
+        return score, extracted
+
+    return 0.0, None
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
 
 def wait_for_health(host: str, port: int, label: str,
                     poll: float = 3.0, timeout: float = 1200.0) -> None:
@@ -142,7 +356,6 @@ def http_stream_completion(url: str, body: dict, timeout: float = 600) -> dict:
     stream_body = {
         **body,
         "stream": True,
-        # Best effort: include usage in final chunk when supported.
         "stream_options": {"include_usage": True},
     }
 
@@ -221,7 +434,7 @@ def two_phase_disagg_completion(
     timeout: float = 600,
 ) -> dict:
     """
-    Built-in fallback for disaggregated serving without toy_proxy_server.py:
+    Built-in two-phase disaggregated serving:
       1) prefill on node 0 with do_remote_decode=True
       2) decode on node 1 with returned kv_transfer_params
     """
@@ -241,9 +454,6 @@ def two_phase_disagg_completion(
 
     kv_params = extract_kv_transfer_params(prefill_resp)
     if not kv_params:
-        # Some builds may complete remote decode directly for this request.
-        # In that case, return the prefill response if it already looks like
-        # a normal completion payload.
         choices = prefill_resp.get("choices")
         if isinstance(choices, list) and choices:
             return prefill_resp
@@ -318,28 +528,20 @@ def vllm_cmd(args: argparse.Namespace, port: int, kv_config: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def run_prefill(args: argparse.Namespace, my_host: str) -> None:
-    """
-    Launch vLLM as the prefill (KV producer) instance, then hand over
-    to it via os.execvp so this Python process is fully replaced.
-    Rank 0 blocks here until the job is cancelled by rank 1.
-    """
     kv_config = make_kv_config("kv_producer")
     print(f"[Prefill] host={my_host}  port={PREFILL_PORT}  model={args.model}")
     print(f"[Prefill] NIXL side-channel: {my_host}:{NIXL_SIDE_CHANNEL_PORT}")
     print(f"[Prefill] KV config: {kv_config}")
 
-    # Each node has exactly one GPU — CUDA_VISIBLE_DEVICES=0 is correct.
     os.environ.update({
         "CUDA_VISIBLE_DEVICES":        "0",
         "VLLM_KV_CACHE_LAYOUT":        "HND",
-        # Bind the side-channel listener to this node's own hostname so the
-        # decode node can reach it across the network.
         "VLLM_NIXL_SIDE_CHANNEL_HOST": my_host,
         "VLLM_NIXL_SIDE_CHANNEL_PORT": str(NIXL_SIDE_CHANNEL_PORT),
     })
 
     cmd = vllm_cmd(args, PREFILL_PORT, kv_config)
-    os.execvp(cmd[0], cmd)   # replaces this process — nothing below runs
+    os.execvp(cmd[0], cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -347,10 +549,6 @@ def run_prefill(args: argparse.Namespace, my_host: str) -> None:
 # ---------------------------------------------------------------------------
 
 def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> None:
-    """
-    Launch vLLM as the decode (KV consumer) instance, then use the
-    built-in two-phase prefill→decode flow, process prompts, and clean up.
-    """
     kv_config = make_kv_config("kv_consumer")
     print(f"[Decode] port={DECODE_PORT}  model={args.model}")
     print(f"[Decode] host={my_host}")
@@ -368,13 +566,13 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
         f"method={prune_cfg.method}, keep_ratio={prune_cfg.keep_ratio:.2f}, "
         f"min_tokens={prune_cfg.min_tokens}, seed={prune_cfg.seed}"
     )
+    print(f"[Decode] Dataset: {args.dataset}"
+          + (f"  subset={args.dataset_subset}" if args.dataset_subset else ""))
 
     decode_env = {
         **os.environ,
-        "CUDA_VISIBLE_DEVICES":        "0",   # one GPU per node
+        "CUDA_VISIBLE_DEVICES":        "0",
         "VLLM_KV_CACHE_LAYOUT":        "HND",
-        # vLLM 0.18.0 starts a listener thread on each instance.
-        # Therefore this must be a local bindable host on the decode node.
         "VLLM_NIXL_SIDE_CHANNEL_HOST": my_host,
         "VLLM_NIXL_SIDE_CHANNEL_PORT": str(NIXL_SIDE_CHANNEL_PORT),
     }
@@ -396,7 +594,6 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
                 p.kill()
         slurm_job = os.environ.get("SLURM_JOB_ID")
         if slurm_job:
-            # scancel terminates ALL nodes in the job, including rank 0 (prefill).
             print(f"[Decode] Cancelling SLURM job {slurm_job} ...")
             os.system(f"scancel {slurm_job}")
         sys.exit(0)
@@ -404,8 +601,6 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT,  cleanup)
 
-    # ── Wait for both vLLM instances to be healthy ────────────────────────
-    # Decode health is local; prefill health is checked over the network.
     wait_for_health(prefill_host, PREFILL_PORT, "Prefill")
     wait_for_health("localhost",  DECODE_PORT,  "Decode")
 
@@ -426,15 +621,36 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
         except Exception as exc:
             print(f"[Warmup] Warning: {exc} (continuing)", file=sys.stderr)
 
-    # ── Process prompts ───────────────────────────────────────────────────
-    prompts = load_prompts(args.prompts_file)
-    print(f"\n[Decode] Loaded {len(prompts)} prompt(s) from '{args.prompts_file}'")
+    # ── Load items (prompt + optional ground truth) ───────────────────────
+    if args.dataset == "none":
+        raw_prompts = load_prompts(args.prompts_file)
+        items = [
+            {
+                "prompt":         p,
+                "prompt_display": p[:80].replace("\n", " ").replace("'", " "),
+                "ground_truth":   None,
+            }
+            for p in raw_prompts
+        ]
+    else:
+        items = load_dataset_items(
+            args.dataset,
+            args.dataset_subset,
+            args.dataset_n_samples,
+            args.dataset_seed,
+        )
+
+    print(f"\n[Decode] Loaded {len(items)} item(s)")
 
     results = []
     wall_start = time.perf_counter()
 
-    for idx, prompt in enumerate(prompts, 1):
-        print(f"[Decode] Processing prompt {idx}/{len(prompts)} ...")
+    for idx, item in enumerate(items, 1):
+        prompt          = item["prompt"]
+        prompt_display  = item.get("prompt_display", prompt[:80].replace("\n", " ").replace("'", " "))
+        ground_truth    = item.get("ground_truth")
+
+        print(f"[Decode] Processing item {idx}/{len(items)} ...")
         prune_result = prune_prompt(prompt, prune_cfg)
         if prune_result.applied:
             reduction = 1.0 - (prune_result.kept_tokens / prune_result.original_tokens)
@@ -461,111 +677,261 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
                 prefill_host=prefill_host,
             )
 
-            usage      = response.get("usage", {})
-            output     = response["choices"][0]["text"]
-            metrics = response.get("metrics", {})
-            total_t = metrics.get("total_time")
-            ttft    = metrics.get("ttft")
+            usage     = response.get("usage", {})
+            output    = response["choices"][0]["text"]
+            metrics   = response.get("metrics", {})
+            total_t   = metrics.get("total_time")
+            ttft      = metrics.get("ttft")
             prefill_t = metrics.get("prefill_http_time")
 
             n_compl = usage.get("completion_tokens")
             count_is_estimate = False
             if not n_compl:
-                # Fallback when streaming usage is unavailable.
                 n_compl = len(output.split())
                 count_is_estimate = True
 
             ms_per_tok = (total_t / n_compl * 1000) if (total_t and n_compl) else None
 
-            results.append({"prompt": prompt, "output": output,
-                             "prompt_after_pruning": prune_result.text,
-                             "prompt_tokens_before_pruning": prune_result.original_tokens,
-                             "prompt_tokens_after_pruning": prune_result.kept_tokens,
-                             "usage": usage,
-                             "total_time": total_t,
-                             "ttft": ttft,
-                             "prefill_http_time": prefill_t,
-                             "completion_tokens": n_compl,
-                             "completion_tokens_estimated": count_is_estimate,
-                             "ms_per_token": ms_per_tok})
+            score, extracted = (
+                score_result(output, ground_truth, args.dataset)
+                if (args.dataset != "none" and ground_truth is not None)
+                else (None, None)
+            )
+
+            results.append({
+                "prompt":                       prompt,
+                "prompt_display":               prompt_display,
+                "output":                       output,
+                "ground_truth":                 ground_truth,
+                "score":                        score,
+                "extracted_answer":             extracted,
+                "prompt_after_pruning":         prune_result.text,
+                "prompt_tokens_before_pruning": prune_result.original_tokens,
+                "prompt_tokens_after_pruning":  prune_result.kept_tokens,
+                "usage":                        usage,
+                "total_time":                   total_t,
+                "ttft":                         ttft,
+                "prefill_http_time":            prefill_t,
+                "completion_tokens":            n_compl,
+                "completion_tokens_estimated":  count_is_estimate,
+                "ms_per_token":                 ms_per_tok,
+            })
 
         except Exception as exc:
-            import traceback
-            print(f"[Decode] ERROR on prompt {idx}: {exc}", file=sys.stderr)
+            print(f"[Decode] ERROR on item {idx}: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-            results.append({"prompt": prompt, "error": str(exc)})
+            results.append({
+                "prompt":        prompt,
+                "prompt_display": prompt_display,
+                "ground_truth":  ground_truth,
+                "error":         str(exc),
+            })
 
     wall_elapsed = time.perf_counter() - wall_start
 
-    # ── Summary ───────────────────────────────────────────────────────────
+    # ── Aggregate values ──────────────────────────────────────────────────
+    ok = [r for r in results if "error" not in r]
+
+    ttft_vals    = [r["ttft"]              for r in ok if r.get("ttft")              is not None]
+    tpot_vals    = [r["ms_per_token"]      for r in ok if r.get("ms_per_token")      is not None]
+    e2e_vals     = [r["total_time"]        for r in ok if r.get("total_time")        is not None]
+    prefill_vals = [r["prefill_http_time"] for r in ok if r.get("prefill_http_time") is not None]
+    total_ctok   = sum(r.get("completion_tokens", 0) or 0 for r in ok)
+    tok_per_s    = (total_ctok / wall_elapsed) if (wall_elapsed > 0 and total_ctok) else None
+
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else None
+
+    # ── Accuracy values ───────────────────────────────────────────────────
+    n_correct = acc_pct = avg_score = ds_tag = threshold_label = None
+    if args.dataset != "none":
+        scored = [r for r in ok if r.get("score") is not None]
+        n_scored  = len(scored)
+        avg_score = _mean([r["score"] for r in scored]) or 0.0
+        if args.dataset == "aime25":
+            n_correct       = sum(1 for r in scored if r["score"] >= 1.0)
+            threshold_label = "exact match"
+        else:
+            n_correct       = sum(1 for r in scored if r["score"] >= 0.3)
+            threshold_label = "F1 >= 0.3"
+        acc_pct = (n_correct / n_scored * 100) if n_scored else 0.0
+        ds_tag  = (
+            (args.dataset_subset or LVEVAL_DEFAULT_SUBSET).replace("-", "_")
+            if args.dataset == "lveval"
+            else args.dataset
+        )
+
+    # ── Build aggregate dict (used for CSV and printing) ──────────────────
+    agg = {
+        "timestamp":        datetime.datetime.now().isoformat(timespec="seconds"),
+        "model":            args.model,
+        "dataset":          args.dataset,
+        "dataset_subset":   args.dataset_subset or "",
+        "n_samples":        args.dataset_n_samples,
+        "dataset_seed":     args.dataset_seed,
+        "n_total":          len(results),
+        "n_ok":             len(ok),
+        "n_err":            len(results) - len(ok),
+        "wall_elapsed_s":   round(wall_elapsed, 3),
+        "ttft_mean_s":      _mean(ttft_vals),
+        "ttft_p50_s":       percentile(ttft_vals, 50),
+        "ttft_p95_s":       percentile(ttft_vals, 95),
+        "ttft_p99_s":       percentile(ttft_vals, 99),
+        "e2e_mean_s":       _mean(e2e_vals),
+        "e2e_p50_s":        percentile(e2e_vals, 50),
+        "e2e_p95_s":        percentile(e2e_vals, 95),
+        "e2e_p99_s":        percentile(e2e_vals, 99),
+        "prefill_mean_s":   _mean(prefill_vals),
+        "prefill_p50_s":    percentile(prefill_vals, 50),
+        "prefill_p95_s":    percentile(prefill_vals, 95),
+        "prefill_p99_s":    percentile(prefill_vals, 99),
+        "tpot_mean_ms":     _mean(tpot_vals),
+        "tok_per_s":        tok_per_s,
+        "total_ctok":       total_ctok,
+        "acc_pct":          acc_pct,
+        "avg_score":        avg_score,
+        "n_correct":        n_correct,
+    }
+
+    # ── SUMMARY header (parsed by parse_results.py) ───────────────────────
     print(f"\n{'='*60}")
     print(f"  SUMMARY  ({len(results)} prompts, wall-clock {wall_elapsed:.3f}s)")
     print(f"{'='*60}")
 
-    ok = [r for r in results if "error" not in r]
-    mean_ttft_vals = [r["ttft"] for r in ok if r.get("ttft") is not None]
-    mean_tpot_vals = [r["ms_per_token"] for r in ok if r.get("ms_per_token") is not None]
-
+    # Per-prompt compact lines (ALL items — parse_results.py reads these)
     print("\n  Per-prompt metrics:")
     for j, r in enumerate(results, 1):
+        disp = r.get("prompt_display", r["prompt"])[:80]
         if "error" in r:
-            print(f"    [{j}] ERROR | prompt='{r['prompt']}' | msg={r['error']}")
+            print(f"    [{j}] ERROR | prompt='{disp}' | msg={r['error']}")
             continue
-
-        ttft = r.get("ttft")
-        ttft_s = f"{ttft:.3f}s" if ttft is not None else "n/a"
-        tpot = r.get("ms_per_token")
-        tpot_s = f"{tpot:.1f}ms" if tpot is not None else "n/a"
-        c_tok = r.get("completion_tokens")
-        est = " (est.)" if r.get("completion_tokens_estimated") else ""
-        total_t = r.get("total_time")
-        total_s = f"{total_t:.3f}s" if total_t is not None else "n/a"
-        prefill_t = r.get("prefill_http_time")
-        prefill_s = f"{prefill_t:.3f}s" if prefill_t is not None else "n/a"
+        ttft_v    = r.get("ttft")
+        tpot_v    = r.get("ms_per_token")
+        total_v   = r.get("total_time")
+        prefill_v = r.get("prefill_http_time")
+        c_tok     = r.get("completion_tokens")
+        est       = " (est.)" if r.get("completion_tokens_estimated") else ""
         print(
-            f"    [{j}] OK    | prompt='{r['prompt']}' | "
-            f"completion={c_tok}{est} | ttft={ttft_s} | tpot={tpot_s} | "
-            f"total={total_s} | prefill={prefill_s}"
+            f"    [{j}] OK    | prompt='{disp}' | "
+            f"completion={c_tok}{est} | "
+            f"ttft={_fmt_s(ttft_v)} | tpot={_fmt_ms(tpot_v)} | "
+            f"total={_fmt_s(total_v)} | prefill={_fmt_s(prefill_v)}"
         )
 
-    for j, r in enumerate(results, 1):
-        print(f"\n  [{j}] Input : {r['prompt']}")
+    # Verbose detail — first 5 only
+    SHOW = 5
+    print(f"\n  Detail (first {min(SHOW, len(results))} of {len(results)}):")
+    for j, r in enumerate(results[:SHOW], 1):
+        disp = r.get("prompt_display", r["prompt"])[:80]
+        print(f"\n  [{j}] Input : {disp}")
         if "error" in r:
             print(f"      Error : {r['error']}")
         else:
-            u = r["usage"]
+            u = r.get("usage", {})
             print(f"      Tokens: prompt={u.get('prompt_tokens')}  "
                   f"completion={r.get('completion_tokens')}"
                   f"{' (est.)' if r.get('completion_tokens_estimated') else ''}")
-            if r.get("ttft") is not None:
-                print(f"      TTFT  : {r['ttft']:.3f}s")
-            print(f"      Time  : {r['total_time']:.3f}s", end="")
-            if r["ms_per_token"] is not None:
-                print(f"  |  {r['ms_per_token']:.1f} ms/output-token")
-            else:
-                print()
+            print(f"      TTFT  : {_fmt_s(r.get('ttft'))}")
+            print(f"      E2E   : {_fmt_s(r.get('total_time'))}  "
+                  f"tpot={_fmt_ms(r.get('ms_per_token'))}")
+            if args.dataset != "none" and r.get("score") is not None:
+                print(f"      Score : {r['score']:.4f}  "
+                      f"extracted='{r.get('extracted_answer', '')}'  "
+                      f"ref='{r.get('ground_truth', '')}'")
+    if len(results) > SHOW:
+        print(f"\n  ... ({len(results) - SHOW} more items not shown)")
 
+    # Responses — first 5 only
     print(f"\n{'='*60}")
-    print("  RESPONSES")
+    print(f"  RESPONSES (first {min(SHOW, len(results))} of {len(results)})")
     print(f"{'='*60}")
-    for j, r in enumerate(results, 1):
-        print(f"\n  [{j}] Input : {r['prompt']}")
+    for j, r in enumerate(results[:SHOW], 1):
+        disp = r.get("prompt_display", r["prompt"])[:80]
+        print(f"\n  [{j}] Input : {disp}")
         if "error" in r:
             print(f"      Error : {r['error']}")
         else:
-            print(f"      Output: {r['output']}")
+            out = r.get("output", "")
+            print(f"      Output: {out[:500]}" + ("..." if len(out) > 500 else ""))
+    if len(results) > SHOW:
+        print(f"\n  ... ({len(results) - SHOW} more responses not shown)")
 
+    # ── Aggregate metrics ─────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print("  AVG METRICS")
+    print("  AGGREGATE METRICS")
     print(f"{'='*60}")
-    if mean_ttft_vals:
-        print(f"  Avg TTFT           : {sum(mean_ttft_vals)/len(mean_ttft_vals):.3f}s")
-    else:
-        print("  Avg TTFT           : n/a")
-    if mean_tpot_vals:
-        print(f"  Avg ms/output-token: {sum(mean_tpot_vals)/len(mean_tpot_vals):.1f} ms")
-    else:
-        print("  Avg ms/output-token: n/a")
+    print(f"  Errors             : {agg['n_err']} / {agg['n_total']}")
+
+    def _stat_row(label: str, mean, p50, p95, p99, fmt_fn) -> None:
+        print(f"  {label:<20} mean={fmt_fn(mean)}  "
+              f"p50={fmt_fn(p50)}  p95={fmt_fn(p95)}  p99={fmt_fn(p99)}")
+
+    _stat_row("TTFT",         agg["ttft_mean_s"],    agg["ttft_p50_s"],
+              agg["ttft_p95_s"],    agg["ttft_p99_s"],    _fmt_s)
+    _stat_row("E2E latency",  agg["e2e_mean_s"],     agg["e2e_p50_s"],
+              agg["e2e_p95_s"],     agg["e2e_p99_s"],     _fmt_s)
+    _stat_row("Prefill time", agg["prefill_mean_s"], agg["prefill_p50_s"],
+              agg["prefill_p95_s"], agg["prefill_p99_s"], _fmt_s)
+    print(f"  {'TPOT (ms/tok)':<20} mean={_fmt_ms(agg['tpot_mean_ms'])}")
+    tps_str = f"{agg['tok_per_s']:.1f} tok/s" if agg["tok_per_s"] else "n/a"
+    print(f"  {'Throughput':<20} {tps_str}"
+          f"  (total_ctok={agg['total_ctok']}, wall={wall_elapsed:.1f}s)")
+
+    # ── Accuracy ──────────────────────────────────────────────────────────
+    if args.dataset != "none":
+        print(f"\n{'='*60}")
+        print(f"  ACCURACY [{ds_tag}]  ({threshold_label})")
+        print(f"{'='*60}")
+        print(f"  Correct   : {n_correct} / {n_scored} ({acc_pct:.2f}%)")
+        print(f"  Avg score : {avg_score:.4f}")
+
+    # ── Save CSVs ─────────────────────────────────────────────────────────
+    if args.output_dir is not None:
+        out_dir = args.output_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts_str     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ds_slug    = args.dataset if args.dataset != "none" else "prompts"
+        # Sanitize model name: "Qwen/Qwen3-4B" → "Qwen3-4B"
+        model_slug = re.sub(r"[^\w\-.]", "_", args.model.split("/")[-1])
+        run_slug   = f"{model_slug}_{ds_slug}_{ts_str}"
+
+        # Per-prompt CSV
+        prompt_csv = out_dir / f"per_prompt_{run_slug}.csv"
+        pp_fields  = [
+            "idx", "prompt_display", "ground_truth", "extracted_answer", "score",
+            "prompt_tokens", "completion_tokens", "completion_tokens_estimated",
+            "ttft_s", "prefill_s", "e2e_s", "tpot_ms", "error",
+        ]
+        with prompt_csv.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=pp_fields, extrasaction="ignore")
+            w.writeheader()
+            for j, r in enumerate(results, 1):
+                u = r.get("usage", {})
+                w.writerow({
+                    "idx":                        j,
+                    "prompt_display":             r.get("prompt_display", ""),
+                    "ground_truth":               str(r.get("ground_truth", "")),
+                    "extracted_answer":           r.get("extracted_answer", ""),
+                    "score":                      r.get("score", ""),
+                    "prompt_tokens":              u.get("prompt_tokens", ""),
+                    "completion_tokens":          r.get("completion_tokens", ""),
+                    "completion_tokens_estimated": r.get("completion_tokens_estimated", ""),
+                    "ttft_s":                     r.get("ttft", ""),
+                    "prefill_s":                  r.get("prefill_http_time", ""),
+                    "e2e_s":                      r.get("total_time", ""),
+                    "tpot_ms":                    r.get("ms_per_token", ""),
+                    "error":                      r.get("error", ""),
+                })
+
+        # Summary CSV (one row per run)
+        summary_csv = out_dir / f"summary_{run_slug}.csv"
+        with summary_csv.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(agg.keys()))
+            w.writeheader()
+            w.writerow(agg)
+
+        print(f"\n[CSV] per-prompt : {prompt_csv}")
+        print(f"[CSV] summary    : {summary_csv}")
 
     cleanup()
 
@@ -578,11 +944,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="vLLM NixlConnector PD disaggregation — two nodes, one GPU each"
     )
-    parser.add_argument("--model",                   default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--max-tokens",    type=int, default=1024)
-    parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
-    parser.add_argument("--block-size",    type=int, default=128,
+    parser.add_argument("--model", default="Qwen/Qwen3-4B")
+    parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable Qwen3 thinking mode (--enable-reasoning + qwen3 parser)")
+    parser.add_argument("--max-tokens",    type=int, default=4096)
+    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--block-size",    type=int, default=1024,
                         help="KV cache block size in tokens "
                              "(larger = fewer transfer round-trips)")
     parser.add_argument("--prompts-file",  type=Path,
@@ -592,46 +960,67 @@ def main() -> None:
     parser.add_argument("--no-warmup", action="store_false", dest="warmup",
                         help="Disable the warmup request")
     parser.add_argument("--warmup-max-tokens", type=int, default=4)
+
+    # ── Pruning ───────────────────────────────────────────────────────────
     parser.add_argument(
         "--pruning-method",
         choices=["none", "attn_proxy", "random"],
         default="none",
-        help="Prompt-side pruning mode for method-2 experiments.",
+    )
+    parser.add_argument("--pruning-keep-ratio", type=float, default=1.0)
+    parser.add_argument("--pruning-min-tokens", type=int,   default=0)
+    parser.add_argument("--pruning-seed",       type=int,   default=42)
+
+    # ── Dataset ───────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--dataset",
+        choices=["none", "lveval", "aime25"],
+        default="none",
+        help=(
+            "Evaluation dataset. "
+            "'lveval' → Infinigence/LVEval (F1 accuracy); "
+            "'aime25' → math-ai/aime25 (exact-match accuracy). "
+            "Default: none (read from --prompts-file)."
+        ),
     )
     parser.add_argument(
-        "--pruning-keep-ratio",
-        type=float,
-        default=1.0,
-        help="Fraction of tokens kept by the pruner (0.0-1.0).",
+        "--dataset-subset",
+        default=None,
+        help=f"LVEval subset name (default: {LVEVAL_DEFAULT_SUBSET}). "
+             "E.g. hotpotqa_en, hotpotqa_zh, 2wikimqa_en, multifieldqa_en …",
     )
     parser.add_argument(
-        "--pruning-min-tokens",
+        "--dataset-n-samples",
         type=int,
-        default=0,
-        help="Only prune prompts with at least this many tokens "
-             "(0 = always prune when method != none).",
+        default=100,
+        help="Number of dataset instances to sample (default: 100).",
     )
     parser.add_argument(
-        "--pruning-seed",
+        "--dataset-seed",
         type=int,
         default=42,
-        help="Random seed used when pruning method is random.",
+        help="Random seed for dataset sampling (default: 42).",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=SCRIPT_DIR / "results",
+        help="Directory to write per_prompt_*.csv and summary_*.csv "
+             f"(default: {SCRIPT_DIR}/results).",
+    )
+
     args = parser.parse_args()
     if not (0.0 <= args.pruning_keep_ratio <= 1.0):
         parser.error("--pruning-keep-ratio must be in [0.0, 1.0]")
 
-    # SLURM_PROCID is set by srun on every task: 0 on node 0, 1 on node 1.
     rank = int(os.environ.get("SLURM_PROCID", 0))
 
-    # PREFILL_HOST is exported by pd_dis.sh before srun and inherited by both tasks.
     prefill_host = os.environ.get("PREFILL_HOST", "")
     if not prefill_host:
         print("[ERROR] PREFILL_HOST is not set. "
               "Make sure pd_dis.sh exported it before calling srun.", file=sys.stderr)
         sys.exit(1)
 
-    import socket
     my_host = socket.getfqdn()
     print(f"[Rank {rank}] host={my_host}  prefill_host={prefill_host}  model={args.model}")
 
@@ -643,4 +1032,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

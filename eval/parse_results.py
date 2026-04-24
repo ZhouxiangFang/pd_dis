@@ -45,6 +45,13 @@ SUMMARY = re.compile(
     r"SUMMARY\s+\((?P<n>\d+)\s+prompts,\s+wall-clock\s+(?P<wall>[\d.]+)s"
 )
 
+ACCURACY = re.compile(
+    r"ACCURACY\s+\[(?P<dataset>\w+)\].*?"
+    r"Correct\s*:\s*(?P<n_correct>\d+)\s*/\s*(?P<n_total>\d+)\s+\((?P<acc>[\d.]+)%\)"
+    r".*?Avg score\s*:\s*(?P<avg_score>[\d.]+)",
+    re.DOTALL,
+)
+
 
 def percentile(xs, p):
     if not xs:
@@ -81,6 +88,17 @@ def parse_log(path):
     sm = SUMMARY.search(text)
     wall = float(sm.group("wall")) if sm else None
 
+    am = ACCURACY.search(text)
+    accuracy_info = None
+    if am:
+        accuracy_info = {
+            "dataset":   am.group("dataset"),
+            "n_correct": int(am.group("n_correct")),
+            "n_total":   int(am.group("n_total")),
+            "acc_pct":   float(am.group("acc")),
+            "avg_score": float(am.group("avg_score")),
+        }
+
     # Errors get no compact line (the ERROR case); scan for error markers.
     err_lines = [ln for ln in text.splitlines()
                  if "[Decode] ERROR on prompt" in ln or "| ERROR " in ln]
@@ -89,6 +107,7 @@ def parse_log(path):
         "prompts": list(prompts.values()),
         "wall_clock": wall,
         "errors_in_log": len(err_lines),
+        "accuracy": accuracy_info,
     }
 
 
@@ -155,11 +174,17 @@ def main() -> None:
         a = agg(parsed["prompts"])
         wall = parsed["wall_clock"]
         tps = (a["total_completion_tokens"] / wall) if (wall and wall > 0) else None
+        acc = parsed.get("accuracy") or {}
 
         runs_out.append({
             **rec,
             "wall_clock": wall,
             "tok_per_s": tps,
+            "acc_dataset":  acc.get("dataset"),
+            "acc_n_correct": acc.get("n_correct"),
+            "acc_n_total":   acc.get("n_total"),
+            "acc_pct":       acc.get("acc_pct"),
+            "acc_avg_score": acc.get("avg_score"),
             **a,
         })
 
@@ -203,9 +228,19 @@ def main() -> None:
     md.append(f"Results dir: `{args.results_dir}`")
     md.append(f"Runs parsed: {len(runs_out)}  |  Prompts parsed: {len(raw_rows_out)}")
     md.append("")
-    md.append("| workload | tag | ptok | otok | n_ok | prefill mean | TTFT mean | TTFT p95 | TTFT p99 | E2E mean | E2E p95 | tpot | tok/s | err |")
-    md.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    has_acc = any(r.get("acc_pct") is not None for r in runs_out)
+    acc_header = " accuracy | avg_score |" if has_acc else ""
+    acc_sep    = " ---: | ---: |"         if has_acc else ""
+    md.append(f"| workload | tag | ptok | otok | n_ok | prefill mean | TTFT mean | TTFT p95 | TTFT p99 | E2E mean | E2E p95 | tpot | tok/s | err |{acc_header}")
+    md.append(f"|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|{acc_sep}")
     for (wl, tag), rs in sorted(groups.items()):
+        acc_cells = ""
+        if has_acc:
+            acc_pcts   = [r["acc_pct"]       for r in rs if r.get("acc_pct")       is not None]
+            avg_scores = [r["acc_avg_score"]  for r in rs if r.get("acc_avg_score") is not None]
+            acc_mean   = (sum(acc_pcts)   / len(acc_pcts))   if acc_pcts   else None
+            score_mean = (sum(avg_scores) / len(avg_scores)) if avg_scores else None
+            acc_cells = f" {fmt(acc_mean, prec=1)}% | {fmt(score_mean)} |"
         md.append(
             "| " + " | ".join([
                 wl, tag or "-",
@@ -220,7 +255,7 @@ def main() -> None:
                 fmt(avg(rs, "tpot_mean_ms"), "ms"),
                 fmt(avg(rs, "tok_per_s"), "tps"),
                 str(sum(r["n_err"] for r in rs)),
-            ]) + " |"
+            ]) + f" |{acc_cells}"
         )
 
     md_path = args.results_dir / "summary.md"

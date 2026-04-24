@@ -2,3 +2,4 @@ vllm
 transformers>=4.37.0
 torch>=2.0.0
 accelerate>=0.20.0
+datasets>=2.14.0

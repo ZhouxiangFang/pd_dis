@@ -30,6 +30,20 @@
 # Usage
 #   sbatch pd_dis.sh
 #   sbatch pd_dis.sh --model Qwen/Qwen2.5-7B-Instruct --max-tokens 256
+#   sbatch pd_dis.sh --dataset aime25 --max-tokens 16384
+#   sbatch pd_dis.sh --dataset lveval --dataset-subset hotpotqa_en --max-tokens 512
+#   sbatch pd_dis.sh --dataset lveval --dataset-n-samples 100 --dataset-seed 42
+#
+# Dataset options (forwarded to pd_dis.py):
+#   --dataset none|lveval|aime25   (default: none → use --prompts-file)
+#   --dataset-subset <name>        LVEval subset, e.g. hotpotqa_en (default)
+#   --dataset-n-samples <N>        Instances to sample (default: 100)
+#   --dataset-seed <N>             Random seed for sampling (default: 42)
+#   --output-dir <path>            Write per_prompt_*.csv + summary_*.csv here
+#
+# Metrics reported (inline + parseable by eval/parse_results.py):
+#   TTFT mean/p50/p95/p99, E2E mean/p50/p95/p99, prefill mean/p95,
+#   TPOT ms/tok, throughput tok/s, error rate, accuracy (dataset mode)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
