@@ -52,7 +52,7 @@
 #SBATCH --account=commons
 #SBATCH --partition=commons
 #SBATCH --job-name=pd_disagg_nixl
-#SBATCH --time=01:00:00
+#SBATCH --time=03:00:00
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:lovelace:1

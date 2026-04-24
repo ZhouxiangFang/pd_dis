@@ -79,7 +79,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 LVEVAL_HF_NAME      = "Infinigence/LVEval"
 AIME25_HF_NAME      = "math-ai/aime25"
-LVEVAL_DEFAULT_SUBSET = "hotpotqa_en"
+LVEVAL_DEFAULT_SUBSET  = "hotpotwikiqa_mixup"
+LVEVAL_LENGTH_LEVELS   = ["16k", "32k", "64k", "128k", "256k"]
+LVEVAL_DEFAULT_LEN     = "16k"
 
 # ---------------------------------------------------------------------------
 # NixlConnector KV-transfer config
@@ -154,6 +156,7 @@ def load_dataset_items(
     subset: str | None,
     n_samples: int,
     seed: int,
+    len_level: str = LVEVAL_DEFAULT_LEN,
 ) -> list[dict]:
     """
     Load evaluation items from a HuggingFace dataset.
@@ -168,7 +171,8 @@ def load_dataset_items(
     rng = random.Random(seed)
 
     if dataset == "lveval":
-        cfg = subset or LVEVAL_DEFAULT_SUBSET
+        base = subset or LVEVAL_DEFAULT_SUBSET
+        cfg  = f"{base}_{len_level}"
         print(f"[Dataset] Loading {LVEVAL_HF_NAME} subset={cfg} ...")
         ds = _hf_load_dataset(LVEVAL_HF_NAME, cfg, split="test")
         indices = list(range(len(ds)))
@@ -184,7 +188,7 @@ def load_dataset_items(
                 f"Based on the above text, answer the following question briefly.\n"
                 f"Question: {question}\nAnswer:"
             )
-            gts = ex.get("output", [])
+            gts = ex.get("answers", ex.get("output", []))
             if isinstance(gts, str):
                 gts = [gts]
             items.append({
@@ -516,7 +520,6 @@ def vllm_cmd(args: argparse.Namespace, port: int, kv_config: str) -> list[str]:
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--block-size",             str(args.block_size),
         "--dtype",                  "float16",
-        "--enforce-eager",
         "--kv-transfer-config",     kv_config,
     ]
     cmd.extend(optional_vllm_serve_flags())
@@ -566,8 +569,10 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
         f"method={prune_cfg.method}, keep_ratio={prune_cfg.keep_ratio:.2f}, "
         f"min_tokens={prune_cfg.min_tokens}, seed={prune_cfg.seed}"
     )
+    _lveval_cfg = f"{args.dataset_subset or LVEVAL_DEFAULT_SUBSET}_{args.dataset_len}"
     print(f"[Decode] Dataset: {args.dataset}"
-          + (f"  subset={args.dataset_subset}" if args.dataset_subset else ""))
+          + (f"  subset={_lveval_cfg}" if args.dataset == "lveval" else
+             (f"  subset={args.dataset_subset}" if args.dataset_subset else "")))
 
     decode_env = {
         **os.environ,
@@ -638,6 +643,7 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
             args.dataset_subset,
             args.dataset_n_samples,
             args.dataset_seed,
+            args.dataset_len,
         )
 
     print(f"\n[Decode] Loaded {len(items)} item(s)")
@@ -646,27 +652,22 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
     wall_start = time.perf_counter()
 
     for idx, item in enumerate(items, 1):
-        prompt          = item["prompt"]
-        prompt_display  = item.get("prompt_display", prompt[:80].replace("\n", " ").replace("'", " "))
-        ground_truth    = item.get("ground_truth")
+        prompt         = item["prompt"]
+        prompt_display = item.get("prompt_display", prompt[:80].replace("\n", " ").replace("'", " "))
+        ground_truth   = item.get("ground_truth")
 
         print(f"[Decode] Processing item {idx}/{len(items)} ...")
         prune_result = prune_prompt(prompt, prune_cfg)
-        if prune_result.applied:
-            reduction = 1.0 - (prune_result.kept_tokens / prune_result.original_tokens)
-            print(
-                f"[Prune] [{idx}] method={prune_result.method} "
-                f"orig_tokens={prune_result.original_tokens} "
-                f"kept_tokens={prune_result.kept_tokens} "
-                f"reduction={reduction:.2%}"
-            )
-        else:
-            print(
-                f"[Prune] [{idx}] method={prune_result.method} "
-                f"orig_tokens={prune_result.original_tokens} "
-                f"kept_tokens={prune_result.kept_tokens} "
-                "reduction=0.00%"
-            )
+        reduction_str = (
+            f"{1.0 - prune_result.kept_tokens / prune_result.original_tokens:.2%}"
+            if prune_result.applied else "0.00%"
+        )
+        print(
+            f"[Prune] [{idx}] method={prune_result.method} "
+            f"orig_tokens={prune_result.original_tokens} "
+            f"kept_tokens={prune_result.kept_tokens} "
+            f"reduction={reduction_str}"
+        )
 
         try:
             response = two_phase_disagg_completion(
@@ -721,10 +722,10 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
             print(f"[Decode] ERROR on item {idx}: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
             results.append({
-                "prompt":        prompt,
+                "prompt":         prompt,
                 "prompt_display": prompt_display,
-                "ground_truth":  ground_truth,
-                "error":         str(exc),
+                "ground_truth":   ground_truth,
+                "error":          str(exc),
             })
 
     wall_elapsed = time.perf_counter() - wall_start
@@ -756,7 +757,7 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
             threshold_label = "F1 >= 0.3"
         acc_pct = (n_correct / n_scored * 100) if n_scored else 0.0
         ds_tag  = (
-            (args.dataset_subset or LVEVAL_DEFAULT_SUBSET).replace("-", "_")
+            f"{(args.dataset_subset or LVEVAL_DEFAULT_SUBSET)}_{args.dataset_len}".replace("-", "_")
             if args.dataset == "lveval"
             else args.dataset
         )
@@ -766,7 +767,10 @@ def run_decode(args: argparse.Namespace, prefill_host: str, my_host: str) -> Non
         "timestamp":        datetime.datetime.now().isoformat(timespec="seconds"),
         "model":            args.model,
         "dataset":          args.dataset,
-        "dataset_subset":   args.dataset_subset or "",
+        "dataset_subset":   (
+            f"{args.dataset_subset or LVEVAL_DEFAULT_SUBSET}_{args.dataset_len}"
+            if args.dataset == "lveval" else (args.dataset_subset or "")
+        ),
         "n_samples":        args.dataset_n_samples,
         "dataset_seed":     args.dataset_seed,
         "n_total":          len(results),
@@ -947,8 +951,10 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable Qwen3 thinking mode (--enable-reasoning + qwen3 parser)")
-    parser.add_argument("--max-tokens",    type=int, default=4096)
-    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--max-tokens",    type=int, default=8192)
+    parser.add_argument("--max-model-len", type=int, default=32768,
+                        help="Max sequence length passed to vLLM. Must not exceed the "
+                             "model's max_position_embeddings (32,768 for Qwen3-4B).")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--block-size",    type=int, default=1024,
                         help="KV cache block size in tokens "
@@ -960,6 +966,8 @@ def main() -> None:
     parser.add_argument("--no-warmup", action="store_false", dest="warmup",
                         help="Disable the warmup request")
     parser.add_argument("--warmup-max-tokens", type=int, default=4)
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="Number of requests to run in parallel (default: 4)")
 
     # ── Pruning ───────────────────────────────────────────────────────────
     parser.add_argument(
@@ -975,7 +983,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         choices=["none", "lveval", "aime25"],
-        default="none",
+        default="aime25",
         help=(
             "Evaluation dataset. "
             "'lveval' → Infinigence/LVEval (F1 accuracy); "
@@ -986,8 +994,17 @@ def main() -> None:
     parser.add_argument(
         "--dataset-subset",
         default=None,
-        help=f"LVEval subset name (default: {LVEVAL_DEFAULT_SUBSET}). "
-             "E.g. hotpotqa_en, hotpotqa_zh, 2wikimqa_en, multifieldqa_en …",
+        help=f"LVEval base subset name without length suffix (default: {LVEVAL_DEFAULT_SUBSET}). "
+             "E.g. hotpotwikiqa_mixup, multifieldqa_en_mixup, loogle_SD_mixup, "
+             "loogle_CR_mixup, loogle_MIR_mixup, factrecall_en, cmrc_mixup.",
+    )
+    parser.add_argument(
+        "--dataset-len",
+        default=LVEVAL_DEFAULT_LEN,
+        choices=LVEVAL_LENGTH_LEVELS,
+        help=f"LVEval context length level (default: {LVEVAL_DEFAULT_LEN}). "
+             "Combined with --dataset-subset to form the HF config name, "
+             f"e.g. hotpotwikiqa_mixup_32k. Choices: {', '.join(LVEVAL_LENGTH_LEVELS)}.",
     )
     parser.add_argument(
         "--dataset-n-samples",
