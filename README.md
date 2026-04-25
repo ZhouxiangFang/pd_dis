@@ -43,7 +43,7 @@ Everything is submitted from the repository root with **`sbatch`**. There are
 **Pruning** heuristics (`attn_proxy`, etc.) live in `methods/attn_pruning/`; see
 `methods/attn_pruning/README.md`.
 
-### Vanilla runs as Baselins on two datasets (`pd_dis.sh`)
+### Vanilla runs as Baselines (`pd_dis.sh`)
 
 #### AIME25 — generation-heavy (long reasoning outputs)
 
@@ -133,6 +133,76 @@ TAG_PREFIX=resweep_$(date +%Y%m%d_%H%M%S) ./eval/launch_full_sweep.sh
 Whole-node jobs: edit `submit_one` in `eval/launch_full_sweep.sh` and add
 `--exclusive` to the `sbatch` line. Extra **driver** flags (not `sbatch`
 flags) can be appended via `SWEEP_EXTRA_FLAGS` as documented in that script.
+
+---
+
+
+## Compression and pipelining sweeps
+
+These are optimization axes **(2) compression** and **(3) pipelining** on the
+same disaggregated baseline: knobs are passed straight into **`vllm serve`** as
+**`--kv-cache-dtype`** (fp8 KV storage) and **`--block-size`** (KV page size =
+NIXL transfer chunk size). No LMCache / CacheGen layer. Typical cells compare
+**fp16 / default block** against fp8 and/or smaller blocks via
+`eval/sweep_compression.sh` and `eval/sweep_pipelining.sh` (see scripts for exact
+matrices).
+
+| Flag | Default | Values | Effect |
+|------|---------|--------|--------|
+| `--kv-cache-dtype` | `auto` (fp16) | `auto`, `fp8_e5m2`, `fp8_e4m3` | Halves KV bytes on the wire for fp8; decode pays dequant in attention. |
+| `--block-size` | `1024` | powers of two in `[16, 2048]` | Smaller blocks increase transfer/decode overlap but add per-chunk overhead. |
+
+> **fp8 prerequisite:** flashinfer JIT needs **`cc1plus`**. The batch scripts load
+> **GCC/13.2.0** and **CUDA/12.4.1**; JIT caches are steered under
+> **`/scratch/$USER/comp529/cache_local`** to avoid HOME quota issues.
+
+### Single-job examples (`pd_dis.sh`)
+
+```bash
+sbatch pd_dis.sh --dataset aime25 --max-tokens 16384
+sbatch pd_dis.sh --dataset aime25 --max-tokens 16384 --kv-cache-dtype fp8_e5m2
+sbatch pd_dis.sh --dataset aime25 --max-tokens 16384 --block-size 128
+sbatch pd_dis.sh --dataset lveval --dataset-len 16k --max-tokens 512 \
+                 --kv-cache-dtype fp8_e5m2 --block-size 128
+```
+
+### Batch sweep scripts
+
+Each sweep writes **`eval/results/<compression|pipelining>_<timestamp>/`** with
+one subdirectory per cell, `summary_*.csv`, `per_prompt_*.csv`, and
+`jobs.txt` for bulk `scancel`.
+
+**`eval/sweep_compression.sh`** — fp16 vs fp8_e5m2 on AIME25 and LVEval (default
+**30** samples per cell, overridable with `N_SAMPLES`).
+
+```bash
+./eval/sweep_compression.sh
+./eval/sweep_compression.sh aime25
+N_SAMPLES=50 ./eval/sweep_compression.sh
+LVEVAL_LEN=32k ./eval/sweep_compression.sh lveval
+```
+
+**`eval/sweep_pipelining.sh`** — block sizes `{16,32,64,128,256,1024}` by default.
+
+```bash
+./eval/sweep_pipelining.sh
+./eval/sweep_pipelining.sh aime25
+BLOCK_SIZES="128 256 1024" ./eval/sweep_pipelining.sh lveval
+```
+
+```bash
+squeue -u $USER -j $(paste -sd, eval/results/compression_*/jobs.txt)
+scancel $(cat eval/results/compression_<ts>/jobs.txt)
+```
+
+### Interpreting results
+
+Both axes are **trade-offs**: fp8 helps TTFT when transfer-bound but can hurt
+decode-heavy E2E; smaller blocks improve overlap until handshake overhead wins.
+Numbers cited for **Qwen2.5-3B** on **synthetic** prompt lengths live in
+[notes/tabs/2026-04-23_pd-dis-compression-pipelining.md](notes/tabs/2026-04-23_pd-dis-compression-pipelining.md)
+and are kept for historical comparison with the current **Qwen3-4B** + dataset
+runs above.
 
 ---
 
@@ -238,71 +308,3 @@ macOS may omit `shopt` and run the loop only when those paths exist.)
 
 ---
 
-## Compression and pipelining sweeps
-
-These are optimization axes **(2) compression** and **(3) pipelining** on the
-same disaggregated baseline: knobs are passed straight into **`vllm serve`** as
-**`--kv-cache-dtype`** (fp8 KV storage) and **`--block-size`** (KV page size =
-NIXL transfer chunk size). No LMCache / CacheGen layer. Typical cells compare
-**fp16 / default block** against fp8 and/or smaller blocks via
-`eval/sweep_compression.sh` and `eval/sweep_pipelining.sh` (see scripts for exact
-matrices).
-
-| Flag | Default | Values | Effect |
-|------|---------|--------|--------|
-| `--kv-cache-dtype` | `auto` (fp16) | `auto`, `fp8_e5m2`, `fp8_e4m3` | Halves KV bytes on the wire for fp8; decode pays dequant in attention. |
-| `--block-size` | `1024` | powers of two in `[16, 2048]` | Smaller blocks increase transfer/decode overlap but add per-chunk overhead. |
-
-> **fp8 prerequisite:** flashinfer JIT needs **`cc1plus`**. The batch scripts load
-> **GCC/13.2.0** and **CUDA/12.4.1**; JIT caches are steered under
-> **`/scratch/$USER/comp529/cache_local`** to avoid HOME quota issues.
-
-### Single-job examples (`pd_dis.sh`)
-
-```bash
-sbatch pd_dis.sh --dataset aime25 --max-tokens 16384
-sbatch pd_dis.sh --dataset aime25 --max-tokens 16384 --kv-cache-dtype fp8_e5m2
-sbatch pd_dis.sh --dataset aime25 --max-tokens 16384 --block-size 128
-sbatch pd_dis.sh --dataset lveval --dataset-len 16k --max-tokens 512 \
-                 --kv-cache-dtype fp8_e5m2 --block-size 128
-```
-
-### Batch sweep scripts
-
-Each sweep writes **`eval/results/<compression|pipelining>_<timestamp>/`** with
-one subdirectory per cell, `summary_*.csv`, `per_prompt_*.csv`, and
-`jobs.txt` for bulk `scancel`.
-
-**`eval/sweep_compression.sh`** — fp16 vs fp8_e5m2 on AIME25 and LVEval (default
-**30** samples per cell, overridable with `N_SAMPLES`).
-
-```bash
-./eval/sweep_compression.sh
-./eval/sweep_compression.sh aime25
-N_SAMPLES=50 ./eval/sweep_compression.sh
-LVEVAL_LEN=32k ./eval/sweep_compression.sh lveval
-```
-
-**`eval/sweep_pipelining.sh`** — block sizes `{16,32,64,128,256,1024}` by default.
-
-```bash
-./eval/sweep_pipelining.sh
-./eval/sweep_pipelining.sh aime25
-BLOCK_SIZES="128 256 1024" ./eval/sweep_pipelining.sh lveval
-```
-
-```bash
-squeue -u $USER -j $(paste -sd, eval/results/compression_*/jobs.txt)
-scancel $(cat eval/results/compression_<ts>/jobs.txt)
-```
-
-### Interpreting results
-
-Both axes are **trade-offs**: fp8 helps TTFT when transfer-bound but can hurt
-decode-heavy E2E; smaller blocks improve overlap until handshake overhead wins.
-Numbers cited for **Qwen2.5-3B** on **synthetic** prompt lengths live in
-[notes/tabs/2026-04-23_pd-dis-compression-pipelining.md](notes/tabs/2026-04-23_pd-dis-compression-pipelining.md)
-and are kept for historical comparison with the current **Qwen3-4B** + dataset
-runs above.
-
----
