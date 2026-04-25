@@ -197,12 +197,11 @@ scancel $(cat eval/results/compression_<ts>/jobs.txt)
 
 ### Interpreting results
 
-Both axes are **trade-offs**: fp8 helps TTFT when transfer-bound but can hurt
-decode-heavy E2E; smaller blocks improve overlap until handshake overhead wins.
-Numbers cited for **Qwen2.5-3B** on **synthetic** prompt lengths live in
-[notes/tabs/2026-04-23_pd-dis-compression-pipelining.md](notes/tabs/2026-04-23_pd-dis-compression-pipelining.md)
-and are kept for historical comparison with the current **Qwen3-4B** + dataset
-runs above.
+Experiments use **Qwen3-4B** on two L40S + InfiniBand (AIME25 / LVEval-16k,
+concurrency 8). **FP8** and **smaller blocks** mainly buy TTFT on long-context
+LVEval; on AIME25 the story is mixed (decode-heavy, FP8 quality cost, block size
+couples to output length). **Pruning** is a separate axis with non-monotonic
+LVEval latency and broken AIME accuracy at our tested keep ratios.
 
 ---
 
