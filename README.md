@@ -24,9 +24,9 @@ artifacts, and repo layout.
 
 | Axis | Idea | Main flags / drivers |
 |------|------|----------------------|
-| **1. Pruning** | Ship fewer prompt tokens by shortening text before prefill. | `--pruning-method`, `--pruning-keep-ratio`; **`pd_dis_chat.sh`**, **`eval/launch_full_sweep.sh`** |
-| **2. Compression** | Fewer bytes per token on the wire (fp8 KV). | `--kv-cache-dtype`; **`eval/sweep_compression.sh`** |
-| **3. Pipelining** | Smaller KV blocks so transfer can overlap decode. | `--block-size`; **`eval/sweep_pipelining.sh`** |
+| **Pruning** | Ship fewer prompt tokens by shortening text before prefill. | `--pruning-method`, `--pruning-keep-ratio`; **`pd_dis_chat.sh`**, **`eval/launch_full_sweep.sh`** |
+| **Compression** | Fewer bytes per token on the wire (fp8 KV). | `--kv-cache-dtype`; **`eval/sweep_compression.sh`** |
+| **Pipelining** | Smaller KV blocks so transfer can overlap decode. | `--block-size`; **`eval/sweep_pipelining.sh`** |
 
 ---
 
