@@ -1,5 +1,17 @@
 # Prefill-Decode Disaggregation (vLLM + NixlConnector)
 
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `pd_dis.sh` | SLURM wrapper: modules, UCX/NIXL env, `srun` → `pd_dis.py` |
+| `pd_dis.py` | Core orchestration, datasets, metrics, CSV export |
+| `pd_dis_chat.sh` / `pd_dis_chat.py` | Chat-template path for report-quality benchmarks |
+| `methods/` | Pruning backends (`attn_proxy`, `random`, tests) |
+| `eval/` | `launch_full_sweep.sh`, `sweep_compression.sh`, `sweep_pipelining.sh`, `aggregate_sweep.py`, `collect_summaries.py`, … |
+| `prompts.txt` | Used when `--dataset none` (one prompt per line, `#` comments) |
+| `results/` | Default CSV output if `--output-dir` is not set |
+
 This repository implements **two-node** disaggregated LLM serving with **vLLM
 NixlConnector** over **UCX** (InfiniBand–friendly; not NCCL). GPU **0** runs
 prefill (`kv_producer`, port **8100**); GPU **1** runs decode (`kv_consumer`,
@@ -31,7 +43,7 @@ Everything is submitted from the repository root with **`sbatch`**. There are
 **Pruning** heuristics (`attn_proxy`, etc.) live in `methods/attn_pruning/`; see
 `methods/attn_pruning/README.md`.
 
-### Raw dataset runs (`pd_dis.sh`)
+### Vanilla runs as Baselins on two datasets (`pd_dis.sh`)
 
 #### AIME25 — generation-heavy (long reasoning outputs)
 
@@ -75,21 +87,6 @@ sbatch pd_dis.sh \
 > output). For this model, **`--dataset-len 32k`** is about the largest LVEval
 > bucket that still leaves headroom for output and template overhead. Longer
 > buckets need a bigger-context checkpoint (e.g. Qwen3-14B at 131k).
-
-**`--dataset-subset`** base names (no length suffix in the flag):
-
-| Subset | Language | Task type |
-|--------|----------|-----------|
-| `hotpotwikiqa_mixup` | EN | multi-hop QA (default) |
-| `multifieldqa_en_mixup` | EN | single-hop QA |
-| `loogle_SD_mixup` | EN | short-dep QA |
-| `loogle_CR_mixup` | EN | comprehension |
-| `loogle_MIR_mixup` | EN | multi-inference |
-| `factrecall_en` | EN | fact recall |
-| `multifieldqa_zh_mixup` | ZH | single-hop QA |
-| `cmrc_mixup` | ZH | reading comprehension |
-| `dureader_mixup` | ZH | open-domain QA |
-| `lic_mixup` | ZH | in-context |
 
 ### Pruning axis — `pd_dis_chat.sh` + `launch_full_sweep.sh`
 
@@ -309,18 +306,3 @@ and are kept for historical comparison with the current **Qwen3-4B** + dataset
 runs above.
 
 ---
-
-## Repository layout
-
-| Path | Purpose |
-|------|---------|
-| `pd_dis.sh` | SLURM wrapper: modules, UCX/NIXL env, `srun` → `pd_dis.py` |
-| `pd_dis.py` | Core orchestration, datasets, metrics, CSV export |
-| `pd_dis_chat.sh` / `pd_dis_chat.py` | Chat-template path for report-quality benchmarks |
-| `methods/` | Pruning backends (`attn_proxy`, `random`, tests) |
-| `eval/` | `launch_full_sweep.sh`, `sweep_compression.sh`, `sweep_pipelining.sh`, `aggregate_sweep.py`, `collect_summaries.py`, … |
-| `prompts.txt` | Used when `--dataset none` (one prompt per line, `#` comments) |
-| `results/` | Default CSV output if `--output-dir` is not set |
-
-A local **`pd_dis_code/`** folder sometimes appears as a teammate reference
-snapshot; the maintained scripts live at the paths above.
