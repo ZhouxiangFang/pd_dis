@@ -531,6 +531,8 @@ def vllm_cmd(args: argparse.Namespace, port: int, kv_config: str) -> list[str]:
         "--kv-cache-dtype",         args.kv_cache_dtype,
         "--kv-transfer-config",     kv_config,
     ]
+    if args.enforce_eager:
+        cmd.append("--enforce-eager")
     cmd.extend(optional_vllm_serve_flags())
     return cmd
 
@@ -984,6 +986,10 @@ def main() -> None:
                              "on the wire via NIXL (KV IS fp8 in memory → NIXL ships "
                              "fp8 bytes, no extra code needed). Requires GCC module "
                              "loaded for flashinfer JIT (see pd_dis.sh).")
+    parser.add_argument("--enforce-eager", action="store_true", default=False,
+                        help="Pass --enforce-eager to vllm serve. Disables CUDA "
+                             "graph capture, which prevents fp8 flashinfer paths "
+                             "from blowing past the gpu-memory-utilization budget.")
     parser.add_argument("--prompts-file",  type=Path,
                         default=SCRIPT_DIR / "prompts.txt")
     parser.add_argument("--warmup",    action="store_true",  default=True,
