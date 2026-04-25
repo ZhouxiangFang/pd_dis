@@ -4,4 +4,6 @@ __pycache__/
 # Local / teammate reference — not tracked
 /pd_dis_code/
 /resweep_20260424_071611/
-/proposal.tex
+
+# LaTeX sources — keep local only
+*.tex
