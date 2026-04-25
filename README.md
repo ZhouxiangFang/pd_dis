@@ -11,6 +11,10 @@ KV cache is transferred between nodes via **vLLM NixlConnector over UCX** (not N
 
 ## Quick start
 
+The snippets below use **`pd_dis.sh`**. For **baseline vs pruning** on AIME25 /
+LVEval with the chat template, use **`pd_dis_chat.sh`** and see
+[Dataset-mode evaluation: baseline vs pruning](#dataset-mode-evaluation-baseline-vs-pruning-report-matrix).
+
 ### AIME25 — generation-heavy (long reasoning outputs)
 
 Each problem requires up to 16k output tokens of chain-of-thought reasoning.
@@ -71,6 +75,82 @@ sbatch pd_dis.sh \
 
 ---
 
+## Dataset-mode evaluation: baseline vs pruning (report matrix)
+
+The **Quick start** commands above use `pd_dis.sh` (raw prompts). For the
+final-report benchmarks on AIME25 and LVEval, we instead run **`pd_dis_chat.sh`**
+so the Qwen3 chat template (including chain-of-thought) matches the scoring
+pipeline. Pruning is decode-side lexical / proxy attention ranking; see
+`methods/attn_pruning/README.md`.
+
+### What gets measured
+
+| Axis | Settings |
+|------|-----------|
+| Methods | **baseline** (`--pruning-method none`), **prune @ ρ=0.5**, **prune @ ρ=0.3** (`--pruning-method attn_proxy` + `--pruning-keep-ratio`) |
+| Benchmarks | **AIME25** (`--max-tokens 16384`, `--concurrency 8`), **LVEval 16k** (`hotpotwikiqa_mixup` @ 16k, 50 samples, `--max-tokens 512`, `--concurrency 8`) |
+| Repeats | Two independent SLURM jobs per (method, benchmark) cell (`r1`, `r2`) for variance |
+| Extras | LVEval **32k** baseline-only pair; **concurrency=1** baseline controls for AIME25 and LVEval-16k |
+
+### One-off smoke (manual `sbatch`)
+
+From the repo root (add `--exclusive` on shared clusters if your site sees
+NIXL side-channel port collisions):
+
+```bash
+# Baseline — AIME25
+sbatch pd_dis_chat.sh --dataset aime25 --max-tokens 16384 --concurrency 8 \
+  --pruning-method none --output-dir eval/results/smoke_aime_baseline
+
+# Pruning — keep 50% of prompt tokens (tag name in sweeps: prune_k05)
+sbatch pd_dis_chat.sh --dataset aime25 --max-tokens 16384 --concurrency 8 \
+  --pruning-method attn_proxy --pruning-keep-ratio 0.5 \
+  --output-dir eval/results/smoke_aime_k05
+
+# Baseline — LVEval 16k slice (50 prompts)
+sbatch pd_dis_chat.sh --dataset lveval --dataset-len 16k --dataset-n-samples 50 \
+  --max-tokens 512 --concurrency 8 --pruning-method none \
+  --output-dir eval/results/smoke_lv_baseline
+```
+
+### Full matrix launcher
+
+`eval/launch_full_sweep.sh` submits **16 jobs** (12 main matrix + 2× LVEval-32k
+baseline + 2× concurrency-1 controls), writes one subdirectory per cell under
+`eval/results/<TAG_PREFIX>/`, and records `manifest.tsv`.
+
+```bash
+cd /path/to/pd_dis   # repository root
+./eval/launch_full_sweep.sh
+# or name the sweep directory deterministically:
+TAG_PREFIX=resweep_$(date +%Y%m%d_%H%M%S) ./eval/launch_full_sweep.sh
+```
+
+To force **whole-node** jobs (recommended on NOTS if two PD jobs can land on
+overlapping nodes and collide on the NIXL TCP side-channel port), edit
+`submit_one` in `eval/launch_full_sweep.sh` and insert `--exclusive` on the
+`sbatch` line, or pass extra **`pd_dis_chat.sh`** flags via `SWEEP_EXTRA_FLAGS`
+(not extra `sbatch` flags—those must be edited into `sbatch` directly).
+
+### Aggregating results
+
+Each job already writes `summary_*.csv` and `per_prompt_*.csv` into its
+`--output-dir`. To merge **all** cells under one sweep tree into a single table:
+
+```bash
+python3 eval/aggregate_sweep.py --results-dir eval/results/<TAG_PREFIX>
+```
+
+This emits `combined.csv` and `summary.md` next to `manifest.tsv`.
+
+### Reference copy (`pd_dis_code/`)
+
+`pd_dis_code/` is a teammate snapshot kept for reference (same launcher logic
+originally lived there). The maintained entry point for this matrix is
+**`eval/launch_full_sweep.sh`** in the repo root layout above.
+
+---
+
 ## Key options
 
 | Flag | Default | Description |
@@ -106,7 +186,7 @@ After all prompts finish, the script prints three blocks:
 ### Aggregate metrics
 ```
 TTFT           mean=1.234s  p50=1.1s  p95=2.3s  p99=3.1s
-E2E latency    mean=8.5s    p50=8.1s  p95=12.s  p99=15.s
+E2E latency    mean=8.5s    p50=8.1s  p95=12.0s p99=15.0s
 Prefill time   mean=0.21s   p50=0.20s p95=0.31s p99=0.35s
 TPOT (ms/tok)  mean=14.2ms
 Throughput     312.4 tok/s  (total_ctok=15620, wall=50.0s)
@@ -120,7 +200,7 @@ Throughput     312.4 tok/s  (total_ctok=15620, wall=50.0s)
 
 ## CSV output
 
-Results are saved to `pd_dis/results/` (override with `--output-dir`):
+When `--output-dir` is **not** set, `pd_dis.py` writes next to the script:
 
 ```
 results/
@@ -128,7 +208,13 @@ results/
   summary_<model>_<dataset>_<timestamp>.csv      # one row for the whole run
 ```
 
-The summary CSV contains all aggregate metrics (TTFT mean/p50/p95/p99, E2E, prefill, TPOT, throughput, accuracy) in a single row, suitable for comparison across runs.
+That is the repository’s top-level **`results/`** directory (same level as
+`pd_dis.py`). Sweeps and the report matrix instead pass an explicit
+`--output-dir` (for example `eval/results/<tag>/...`) so runs stay grouped.
+
+The summary CSV contains aggregate metrics (TTFT mean/p50/p95/p99, E2E,
+prefill, TPOT, throughput, accuracy) in a single row, suitable for comparison
+across runs.
 
 ---
 
@@ -138,7 +224,9 @@ The summary CSV contains all aggregate metrics (TTFT mean/p50/p95/p99, E2E, pref
 - `pd_dis.py` — prefill/decode orchestration, dataset loading, metrics reporting
 - `prompts.txt` — custom prompts used when `--dataset none` (one per line, `#` for comments)
 - `methods/` — prompt pruning implementations (`attn_proxy`, `random`)
-- `eval/` — sweep drivers + result aggregators (see below)
+- `eval/` — sweep drivers + result aggregators; **`eval/launch_full_sweep.sh`** submits the full baseline vs pruning matrix (`pd_dis_chat.sh`)
+- `pd_dis_chat.sh` / `pd_dis_chat.py` — chat-template + dataset driver used for report numbers
+- `pd_dis_code/` — optional reference snapshot from a teammate (prefer scripts at repo root)
 - `results/` — CSV output directory (created automatically)
 
 ---
@@ -225,6 +313,11 @@ scancel $(cat eval/results/compression_<ts>/jobs.txt)
 
 #### Aggregate results
 
+The **baseline vs pruning** tree produced by `launch_full_sweep.sh` is meant to
+be merged with `python3 eval/aggregate_sweep.py` (see
+[Aggregating results](#aggregating-results) under the report-matrix section).
+The compression / pipelining drivers below use a different helper:
+
 ```bash
 # Combine every summary_*.csv in a sweep directory into one markdown table + CSV
 python3 eval/collect_summaries.py eval/results/compression_20260423_153805
@@ -234,15 +327,22 @@ python3 eval/collect_summaries.py eval/results/pipelining_20260423_153805 \
     --columns dataset tag ttft_mean ttft_p99 e2e_mean tpot_mean_ms accuracy
 ```
 
-Combine compression + pipelining + baseline into one view:
+Combine compression + pipelining cells into one directory for a single
+`collect_summaries` pass (copy each **cell** subdirectory, not the sweep root):
 
 ```bash
 mkdir -p eval/results/combined_all
-for d in eval/results/compression_*/eval/results/pipelining_*/; do
-    cp -r "$d"* eval/results/combined_all/
+shopt -s nullglob
+for d in eval/results/compression_*/*/ eval/results/pipelining_*/*/; do
+  [[ -d "$d" ]] || continue
+  cp -a "$d" eval/results/combined_all/
 done
 python3 eval/collect_summaries.py eval/results/combined_all
 ```
+
+(`shopt -s nullglob` avoids a literal glob error when a pattern matches nothing.
+On macOS default bash 3.2, omit `shopt` and run the loops only when those
+directories exist.)
 
 ### Interpreting the trade-offs
 
